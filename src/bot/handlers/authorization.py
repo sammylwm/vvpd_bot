@@ -1,4 +1,5 @@
 from html import escape
+import re
 
 from aiogram import Router
 from aiogram.filters import StateFilter
@@ -25,10 +26,10 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
     if ms.from_user is None:
         return
 
-    group = " ".join((ms.text or "").split())
-    if not group or group.startswith("/") or len(group) > 64:
+    group = ms.text or ""
+    if re.fullmatch(r"[0-9]{3}-[0-9]{3}", group) is None:
         await ms.answer(
-            "✏️ <b>Напиши название группы текстом</b>\n\n"
+            "✏️ <b>Номер группы должен содержать 3 цифры, дефис и 3 цифры</b>\n\n"
             "Например: <code>261-329</code>\n",
             parse_mode="HTML",
         )
@@ -63,7 +64,7 @@ async def not_sign(ms: Message, state: FSMContext):
             markdown=(
                 "# 🎓 Давай познакомимся!\n\n"
                 "Укажи свою **учебную группу**, чтобы продолжить.\n\n"
-                "✏️ Отправь название одним сообщением.\n"
+                "✏️ Отправь номер в формате: 3 цифры, дефис, 3 цифры.\n"
                 "Например: **261-329**"
             )
         )

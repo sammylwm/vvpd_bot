@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -19,6 +20,7 @@ dp.include_router(router)
 
 async def main():
     dp.update.middleware.register(DbSessionMiddleware())
+    logging.basicConfig(level=logging.DEBUG)
     await dp.start_polling(bot)
 
 
