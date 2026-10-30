@@ -2,7 +2,6 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from core.models import Chat, User, chat_users
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import (
@@ -12,6 +11,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from settings.config import config
+
+from .modules import User
 
 db_url = config.database.async_url
 engine = create_async_engine(url=db_url)
@@ -34,16 +35,6 @@ class DbSessionMiddleware(BaseMiddleware):
         async with async_session_maker() as session:
             try:
                 data["session"] = session
-                if not event.message:
-                    ms = event.data
-                else:
-                    ms = event.message
-                user: User = await user_db(session, ms.from_user.id)
-                chat: Chat = await chat_db(session, ms.chat.id)
-                await link_user_to_chat(session, user, chat)
-                await session.commit()
-                data["user"] = user
-                data["chat"] = chat
                 return await handler(event, data)
             finally:
                 await session.close()
