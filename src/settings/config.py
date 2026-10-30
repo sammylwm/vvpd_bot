@@ -40,3 +40,6 @@ class DatabaseConfig(ConfigBase):
 class Config(BaseSettings):
     bot: BotConfig = BotConfig()
     database: DatabaseConfig = DatabaseConfig()
+
+
+config = Config()
