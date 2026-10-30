@@ -6,12 +6,12 @@ readme = "README.md"
 authors = [
     { name = "sammy", email = "lednevdosa@gmail.com" }
 ]
-requires-python = ">=3.11"
-dependencies = []
-
-[project.scripts]
-vvpd-bot = "vvpd_bot:main"
-
-[build-system]
-requires = ["uv_build>=0.13.6,<0.14.0"]
-build-backend = "uv_build"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "aiogram>=3.31.0",
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.16.2",
+    "sqlalchemy[asyncio]>=2.1.6",
+]
