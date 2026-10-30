@@ -6,7 +6,7 @@ from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
-env_path = Path(__file__).parent / "env"
+env_path = Path(__file__).parent / ".env"
 
 
 class ConfigBase(BaseSettings):

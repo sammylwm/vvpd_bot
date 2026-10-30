@@ -12,9 +12,9 @@ services:
   db:
     image: docker.io/library/postgres:17
     env_file:
-      - app/settings/.env
+      - src/settings/.env
     volumes:
-      - ivt_bot:/var/lib/postgresql/data
+      - teha_bot:/var/lib/postgresql/data
 
 volumes:
-  ivt_bot:
+  teha_bot:

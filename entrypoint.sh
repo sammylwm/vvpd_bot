@@ -3,7 +3,7 @@
 set -e
 
 echo "Apply alembic migrations"
-uv run alembic -c /app/alembic.ini upgrade head
+uv run alembic -c /src/alembic.ini upgrade head
 echo "Successfully applied migrations."
 
 exec "$@"
