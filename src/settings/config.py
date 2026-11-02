@@ -37,9 +37,15 @@ class DatabaseConfig(ConfigBase):
         ).render_as_string(hide_password=False)
 
 
+class AiConfig(ConfigBase):
+    model_config = SettingsConfigDict(env_prefix="AI_")
+    key: SecretStr = SecretStr("")
+
+
 class Config(BaseSettings):
     bot: BotConfig = BotConfig()
     database: DatabaseConfig = DatabaseConfig()
+    ai: AiConfig = AiConfig()
 
 
 config = Config()
