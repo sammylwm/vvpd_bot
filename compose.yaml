@@ -7,6 +7,9 @@ services:
       APP_ENV: prod
     depends_on:
       - db
+    networks:
+      - default
+      - shared
     command: ["uv", "run", "src/main.py"]
 
   db:
@@ -22,5 +25,5 @@ volumes:
 
 networks:
   shared:
+    external: true
     name: poly-shared
-    driver: bridge
