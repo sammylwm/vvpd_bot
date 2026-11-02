@@ -188,8 +188,3 @@ def get_json_homework(
     if not content:
         raise ValueError("AI returned an empty response")
     return Homework.model_validate_json(content).model_dump()
-
-
-if __name__ == "__main__":
-    text = get_json_homework("оп сделать 7-8 лабу", "261-329")
-    print(text)
