@@ -13,7 +13,7 @@ from openai import APIError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai.ai import SubjectClarificationRequired, get_json_homework
+from ai.ai import SubjectClarificationRequired, get_json_homework, is_duplicate_homework
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -69,13 +69,18 @@ async def save_deadline(
         )
         subject = normalize_deadline_text(homework["subject"])
         task = normalize_deadline_text(homework["homework"])
-        for deadline in existing:
-            if (
-                normalize_deadline_text(deadline.subject) == subject
-                and normalize_deadline_text(deadline.deadline) == task
-            ):
-                await session.commit()
-                return False
+        candidates = [
+            deadline.deadline for deadline in existing
+            if normalize_deadline_text(deadline.subject) == subject
+        ]
+        exact_match = any(normalize_deadline_text(value) == task for value in candidates)
+        if exact_match or (
+            candidates and await asyncio.to_thread(
+                is_duplicate_homework, homework["homework"], candidates
+            )
+        ):
+            await session.commit()
+            return False
         session.add(
             Deadline(
                 group_id=db_group.id,
@@ -122,6 +127,13 @@ async def parse_deadline(
         return
     try:
         added = await save_deadline(session, group, homework)
+    except APIError:
+        logger.exception("AI duplicate check is unavailable")
+        await ms.answer(
+            "Сервис ИИ сейчас недоступен. Не удалось проверить дубликаты, "
+            "поэтому дедлайн не добавлен. Повтори сообщение позже или используй /cancel."
+        )
+        return
     except Exception:
         logger.exception("Failed to save deadline")
         await ms.answer(
