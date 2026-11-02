@@ -65,7 +65,7 @@ def render_week(
         "---",
     ]
     headers = ["Пара"] + [f"{names[day.weekday()]} {day:%d.%m}" for day in days]
-    rows = ["| " + " | ".join(headers) + " |", "| :---: | " + " :--- |" * 7]
+    rows = ["| " + " | ".join(headers) + " |", "| :---: | " + " :--- |" * 6]
     pairs = sorted({lesson["pair"] for day in days for lesson in by_date.get(day, [])})
     attached = {day: set() for day in days}
     for pair in pairs:
