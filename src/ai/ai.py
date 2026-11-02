@@ -8,7 +8,13 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from src.settings.config import config
+from settings.config import config
+
+
+class SubjectClarificationRequired(ValueError):
+    """The user must specify which subject the homework belongs to."""
+
+    question = "Не удалось определить предмет. По какому предмету этот дедлайн?"
 
 
 class Homework(BaseModel):
@@ -40,6 +46,7 @@ Expand subject/homework abbreviations. Match subjects to full schedule names;
 the schedule is authoritative. Hints: оп=Офисные приложения,
 яп=Языки программирования, ввп=Введение в профессию,
 тимп=Технологии и методы программирования.
+If the subject is unknown, unrecognized, or ambiguous, leave subject and date empty.
 If multiple subjects match, leave subject and date empty. If no subject is mentioned,
 do not infer it from dates. Capitalize the subject's first letter.
 Dates use DD-MM-YYYY. Resolve explicit dates/weekdays even without a scheduled lesson;
@@ -187,4 +194,7 @@ def get_json_homework(
     content = choice.message.content
     if not content:
         raise ValueError("AI returned an empty response")
-    return Homework.model_validate_json(content).model_dump()
+    homework = Homework.model_validate_json(content)
+    if not homework.subject.strip():
+        raise SubjectClarificationRequired(SubjectClarificationRequired.question)
+    return homework.model_dump()
