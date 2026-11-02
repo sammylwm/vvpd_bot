@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
+from settings.config import config
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def get_day_schedule(
     group: str,
     day: date | None = None,
     *,
-    schedule_base_url: str = "http://127.0.0.1:8000",
+    schedule_base_url: str = config.api.path,
 ) -> dict:
     if re.fullmatch(r"[0-9]{3}-[0-9]{3}", group) is None:
         raise ValueError("Invalid group")

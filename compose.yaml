@@ -18,3 +18,9 @@ services:
 
 volumes:
   teha_bot:
+
+
+networks:
+  shared:
+    name: poly-shared
+    driver: bridge

@@ -42,10 +42,16 @@ class AiConfig(ConfigBase):
     key: SecretStr = SecretStr("")
 
 
+class ApiConfig(ConfigBase):
+    model_config = SettingsConfigDict(env_prefix="API_")
+    path: str = ""
+
+
 class Config(BaseSettings):
     bot: BotConfig = BotConfig()
     database: DatabaseConfig = DatabaseConfig()
     ai: AiConfig = AiConfig()
+    api: ApiConfig = ApiConfig()
 
 
 config = Config()
