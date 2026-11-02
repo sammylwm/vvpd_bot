@@ -9,6 +9,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
+from openai import APIError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -98,6 +99,13 @@ async def parse_deadline(
     except SubjectClarificationRequired as exc:
         await state.set_state(AddDeadline.waiting_for_subject)
         await ms.answer(str(exc))
+        return
+    except APIError:
+        logger.exception("AI service is unavailable")
+        await ms.answer(
+            "Сервис ИИ сейчас недоступен или не отвечает. Дедлайн не добавлен. "
+            "Повтори сообщение позже или используй /cancel для отмены."
+        )
         return
     except Exception:
         logger.exception("Failed to parse deadline")

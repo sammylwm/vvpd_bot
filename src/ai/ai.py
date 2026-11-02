@@ -155,6 +155,8 @@ def get_json_homework(
     with OpenAI(
         api_key=config.ai.key.get_secret_value(),
         base_url="https://api.deepseek.com",
+        timeout=30.0,
+        max_retries=0,
     ) as client:
         response = client.chat.completions.create(
             model="deepseek-flash",
