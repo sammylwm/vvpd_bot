@@ -118,11 +118,14 @@ def get_monthly_schedule(
     group: str,
     today_date: date,
     *,
-    schedule_base_url: str = "http://127.0.0.1:8000",
+    schedule_base_url: str | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     """Expand the API's weekly grid into dated lessons for the next 30 days."""
     if re.fullmatch(r"[0-9]{3}-[0-9]{3}", group) is None:
         raise ValueError("group must use the NNN-NNN format")
+    schedule_base_url = schedule_base_url or config.api.path
+    if not schedule_base_url:
+        raise ValueError("API_PATH is not configured")
     url = f"{schedule_base_url.rstrip('/')}/schedule/{group}"
     # The API may need several requests to rasp.dmami.ru on a cache miss.
     with urlopen(url, timeout=60) as response:
@@ -187,7 +190,7 @@ def get_json_homework(
     group: str,
     today_date: date | None = None,
     *,
-    schedule_base_url: str = "http://127.0.0.1:8000",
+    schedule_base_url: str | None = None,
 ) -> dict[str, str]:
     """Parse user text for a group, raising ValueError for an invalid response.
 
