@@ -23,6 +23,28 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 
+@router.message(Command("reminder"), StateFilter(None))
+async def command_reminder(ms: Message, session: AsyncSession):
+    # Import here because the reminder service reuses this module's day renderer.
+    from bot.reminders import build_reminder_messages
+
+    if ms.from_user is None:
+        return
+    group = await session.scalar(
+        select(Group)
+        .join(User, User.group_id == Group.id)
+        .where(User.telegram_id == ms.from_user.id)
+    )
+    if group is None:
+        await ms.answer("Сначала укажи свою учебную группу.")
+        return
+    messages = await build_reminder_messages(
+        group.id, group.name, datetime.now(ZoneInfo("Europe/Moscow")).date()
+    )
+    for message in messages:
+        await ms.answer_rich(InputRichMessage(markdown=message))
+
+
 def get_day_schedule(
     group: str,
     day: date | None = None,
