@@ -14,6 +14,7 @@ from aiogram.types import InputRichMessage, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.attachments import send_deadline_attachments
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 @router.message(Command("reminder"), StateFilter(None))
 async def command_reminder(ms: Message, session: AsyncSession):
     # Import here because the reminder service reuses this module's day renderer.
-    from bot.reminders import build_reminder_messages
+    from bot.reminders import build_reminder_payload
 
     if ms.from_user is None:
         return
@@ -38,11 +39,12 @@ async def command_reminder(ms: Message, session: AsyncSession):
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
-    messages = await build_reminder_messages(
+    messages, tasks = await build_reminder_payload(
         group.id, group.name, datetime.now(ZoneInfo("Europe/Moscow")).date()
     )
     for message in messages:
         await ms.answer_rich(InputRichMessage(markdown=message))
+    await send_deadline_attachments(ms.bot, ms.chat.id, tasks, ms.message_thread_id)
 
 
 def get_day_schedule(
@@ -213,3 +215,5 @@ async def command_day(ms: Message, command: CommandObject, session: AsyncSession
     await ms.answer_rich(
         InputRichMessage(markdown=render_day(group.name, schedule, deadlines))
     )
+
+    await send_deadline_attachments(ms.bot, ms.chat.id, deadlines, ms.message_thread_id)

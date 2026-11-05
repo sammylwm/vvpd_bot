@@ -8,6 +8,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import InputRichMessage
 from sqlalchemy import select
 
+from bot.attachments import send_deadline_attachments
 from bot.handlers.day import get_day_schedule, markdown_text, render_day
 from core.db_helper import async_session_maker
 from core.modules.deadline import Deadline
@@ -38,9 +39,9 @@ def render_tomorrow_deadlines(day: date, deadlines: list[Deadline]) -> str:
     return "\n\n".join(parts)
 
 
-async def build_reminder_messages(
+async def build_reminder_payload(
     group_id: int, group_name: str, today: date
-) -> list[str]:
+) -> tuple[list[str], list[Deadline]]:
     tomorrow = today + timedelta(days=1)
     try:
         async with async_session_maker() as session:
@@ -58,7 +59,7 @@ async def build_reminder_messages(
         logger.exception("Failed to load reminders for group %s", group_name)
         return [
             "Не удалось загрузить задания. Попробуй проверить их позже через /day."
-        ]
+        ], []
     else:
         try:
             schedule = await asyncio.to_thread(
@@ -82,7 +83,12 @@ async def build_reminder_messages(
             render_tomorrow_deadlines(
                 tomorrow, [task for task in tasks if task.date == tomorrow]
             ),
-        ]
+        ], tasks
+
+
+async def build_reminder_messages(group_id: int, group_name: str, today: date) -> list[str]:
+    messages, _ = await build_reminder_payload(group_id, group_name, today)
+    return messages
 
 
 async def send_reminders(bot: Bot) -> None:
@@ -98,14 +104,15 @@ async def send_reminders(bot: Bot) -> None:
         )
 
     # Fetch the schedule and assignments once per group for this broadcast.
-    messages_by_group: dict[int, list[str]] = {}
+    messages_by_group: dict[int, tuple[list[str], list[Deadline]]] = {}
     for user_id, group_id, group_name in users:
         if group_id not in messages_by_group:
-            messages_by_group[group_id] = await build_reminder_messages(
+            messages_by_group[group_id] = await build_reminder_payload(
                 group_id, group_name, today
             )
 
-        for message in messages_by_group[group_id]:
+        messages, tasks = messages_by_group[group_id]
+        for message in messages:
             failed = False
             while True:
                 try:
@@ -122,6 +129,12 @@ async def send_reminders(bot: Bot) -> None:
             await asyncio.sleep(0.05)
             if failed:
                 break
+
+        if not failed:
+            try:
+                await send_deadline_attachments(bot, user_id, tasks)
+            except TelegramAPIError:
+                logger.exception("Failed to send reminder attachments to user %s", user_id)
 
 
 async def run_reminders(bot: Bot) -> None:

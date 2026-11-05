@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date as Date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import JSON, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -18,3 +18,7 @@ class Deadline(Base):
     date: Mapped[Date]
     subject: Mapped[str] = mapped_column(String)
     deadline: Mapped[str] = mapped_column(Text)
+
+    attachments: Mapped[list[dict[str, str]]] = mapped_column(
+        JSON, default=list, server_default="[]"
+    )

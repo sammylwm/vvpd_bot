@@ -8,6 +8,7 @@ from aiogram.types import InputRichMessage, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.attachments import send_deadline_attachments
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -88,3 +89,5 @@ async def send_deadlines(
     await ms.answer_rich(InputRichMessage(
         markdown=render_deadlines(group.name, start, end, deadlines)
     ))
+
+    await send_deadline_attachments(ms.bot, ms.chat.id, deadlines, ms.message_thread_id)

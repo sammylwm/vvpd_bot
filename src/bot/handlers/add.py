@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 
@@ -13,12 +14,14 @@ from openai import APIError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai.ai import SubjectClarificationRequired, get_json_homework, is_duplicate_homework
+from ai.ai import SubjectClarificationRequired, get_json_homework, reconcile_homework
+from bot.attachments import AlbumMiddleware, message_attachments
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
 
 router = Router()
+router.message.middleware(AlbumMiddleware())
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +36,7 @@ async def command_deadline(ms: Message, state: FSMContext):
     await state.set_state(AddDeadline.waiting_for_text)
     await ms.answer(
         "Отправь текст дедлайна, например: сдать лабораторную по физике до пятницы."
+        "\nМожно прикрепить фото или файлы, в том числе альбомом. Текст укажи в подписи."
         "\nДля отмены: /cancel"
     )
 
@@ -49,10 +53,37 @@ def normalize_deadline_text(text: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class SaveDeadlineResult:
+    status: str  # created, updated, unchanged
+    deadline: Deadline
+
+
+def merge_attachments(
+    existing: list[dict[str, str]], incoming: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    merged = list(existing)
+    for attachment in incoming:
+        if any(
+            attachment["file_id"] == old["file_id"]
+            or (
+                attachment.get("file_unique_id")
+                and attachment.get("file_unique_id") == old.get("file_unique_id")
+            )
+            for old in merged
+        ):
+            continue
+        merged.append(attachment)
+    return merged
+
+
 async def save_deadline(
-    session: AsyncSession, group: str, homework: dict[str, str]
-) -> bool:
-    """Save a new deadline; return False for an existing equivalent deadline."""
+    session: AsyncSession,
+    group: str,
+    homework: dict[str, str],
+    attachments: list[dict[str, str]] | None = None,
+) -> SaveDeadlineResult:
+    """Create or enrich one assignment while holding the group transaction lock."""
     day = datetime.strptime(homework["date"], "%d-%m-%Y").date()
     try:
         # Serialize additions for this group so simultaneous requests cannot duplicate it.
@@ -70,27 +101,48 @@ async def save_deadline(
         subject = normalize_deadline_text(homework["subject"])
         task = normalize_deadline_text(homework["homework"])
         candidates = [
-            deadline.deadline for deadline in existing
+            deadline
+            for deadline in existing
             if normalize_deadline_text(deadline.subject) == subject
         ]
-        exact_match = any(normalize_deadline_text(value) == task for value in candidates)
-        if exact_match or (
-            candidates and await asyncio.to_thread(
-                is_duplicate_homework, homework["homework"], candidates
-            )
-        ):
-            await session.commit()
-            return False
-        session.add(
-            Deadline(
-                group_id=db_group.id,
-                date=day,
-                subject=homework["subject"].strip(),
-                deadline=homework["homework"].strip(),
-            )
+        matched = next(
+            (
+                deadline
+                for deadline in candidates
+                if normalize_deadline_text(deadline.deadline) == task
+            ),
+            None,
         )
+        merged_text = matched.deadline if matched is not None else ""
+        if matched is None and candidates:
+            comparison = await asyncio.to_thread(
+                reconcile_homework,
+                homework["homework"],
+                [deadline.deadline for deadline in candidates],
+            )
+            if comparison.match_index is not None:
+                matched = candidates[comparison.match_index]
+                merged_text = comparison.merged_homework.strip()
+        if matched is not None:
+            files = merge_attachments(matched.attachments or [], attachments or [])
+            changed = normalize_deadline_text(merged_text) != normalize_deadline_text(
+                matched.deadline
+            ) or files != (matched.attachments or [])
+            if changed:
+                matched.deadline = merged_text
+                matched.attachments = files
+            await session.commit()
+            return SaveDeadlineResult("updated" if changed else "unchanged", matched)
+        deadline = Deadline(
+            group_id=db_group.id,
+            date=day,
+            subject=homework["subject"].strip(),
+            deadline=homework["homework"].strip(),
+            attachments=merge_attachments([], attachments or []),
+        )
+        session.add(deadline)
         await session.commit()
-        return True
+        return SaveDeadlineResult("created", deadline)
     except Exception:
         await session.rollback()
         raise
@@ -126,7 +178,10 @@ async def parse_deadline(
         )
         return
     try:
-        added = await save_deadline(session, group, homework)
+        data = await state.get_data()
+        result = await save_deadline(
+            session, group, homework, data.get("attachments", [])
+        )
     except APIError:
         logger.exception("AI duplicate check is unavailable")
         await ms.answer(
@@ -142,23 +197,37 @@ async def parse_deadline(
         return
 
     await state.clear()
-    if not added:
+    if result.status == "unchanged":
         await ms.answer("Такой дедлайн уже есть у твоей группы. Повторно не добавляю.")
         return
+    title = "Дедлайн обновлён." if result.status == "updated" else "Дедлайн добавлен."
+    deadline = result.deadline
     await ms.answer(
-        "Дедлайн добавлен.\n"
-        f"Предмет: {escape(homework['subject'])}\n"
-        f"Дата: {escape(homework['date']) or 'не определена'}\n"
-        f"Задание: {escape(homework['homework'])}",
+        f"{title}\n"
+        f"Предмет: {escape(deadline.subject)}\n"
+        f"Дата: {deadline.date:%d-%m-%Y}\n"
+        f"Задание: {escape(deadline.deadline)}\n"
+        f"Вложений: {len(deadline.attachments or [])}",
         parse_mode="HTML",
     )
 
 
-@router.message(AddDeadline.waiting_for_text, F.text, ~F.text.startswith("/"))
-async def receive_deadline(ms: Message, state: FSMContext, session: AsyncSession):
-    text = (ms.text or "").strip()
+@router.message(AddDeadline.waiting_for_text, ~F.text.startswith("/"))
+async def receive_deadline(
+    ms: Message, state: FSMContext, session: AsyncSession, album: list[Message]
+):
+    text = "\n".join(message.text or message.caption or "" for message in album).strip()
+    attachments = [item for message in album for item in message_attachments(message)]
+    if attachments:
+        data = await state.get_data()
+        attachments = data.get("attachments", []) + attachments
+        await state.update_data(attachments=attachments)
     if not text:
-        await ms.answer("Отправь непустой текст дедлайна.")
+        await ms.answer(
+            "Отправь текст дедлайна с датой. Прикреплённые файлы сохранены."
+            if attachments
+            else "Отправь непустой текст дедлайна."
+        )
         return
     if ms.from_user is None:
         return
@@ -171,7 +240,10 @@ async def receive_deadline(ms: Message, state: FSMContext, session: AsyncSession
         await ms.answer("Сначала укажи свою учебную группу.")
         return
 
-    await state.update_data(deadline_text=text, group=group)
+    if not attachments:
+        data = await state.get_data()
+        attachments = data.get("attachments", [])
+    await state.update_data(deadline_text=text, group=group, attachments=attachments)
     await parse_deadline(ms, state, text, group, session)
 
 
