@@ -92,6 +92,7 @@ async def send_reminders(bot: Bot) -> None:
             await session.execute(
                 select(User.telegram_id, Group.id, Group.name)
                 .join(Group, User.group_id == Group.id)
+                .where(User.reminders_enabled.is_(True))
                 .distinct()
             )
         )
