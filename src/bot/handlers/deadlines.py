@@ -19,15 +19,18 @@ logger = logging.getLogger(__name__)
 
 
 def render_deadlines(
-    group: str, start: date, end: date, deadlines: list[Deadline]
+    group: str, start: date, end: date | None, deadlines: list[Deadline]
 ) -> str:
     parts = [
-        "# 📝 Дедлайны на неделю",
-        f"## {start:%d.%m.%Y} — {end:%d.%m.%Y}",
+        "# 📝 Дедлайны на неделю" if end is not None else "# 📝 Все предстоящие дедлайны",
+        f"## {start:%d.%m.%Y} — {end:%d.%m.%Y}" if end is not None else f"## С {start:%d.%m.%Y}",
         f"🎓 **Группа {markdown_text(group)}**",
     ]
     if not deadlines:
-        parts.append("> ✅ Дедлайнов на эту неделю пока нет.")
+        parts.append(
+            "> ✅ Дедлайнов на эту неделю пока нет."
+            if end is not None else "> ✅ Предстоящих дедлайнов пока нет."
+        )
     current_day = None
     for task in deadlines:
         if task.date != current_day:
@@ -41,11 +44,23 @@ def render_deadlines(
 
 @router.message(Command("deadlines"), StateFilter(None))
 async def command_deadlines(ms: Message, session: AsyncSession):
-    if ms.from_user is None:
-        return
     today = datetime.now(ZoneInfo("Europe/Moscow")).date()
     start = today - timedelta(days=today.weekday())
     end = start + timedelta(days=6)
+    await send_deadlines(ms, session, start, end)
+
+
+@router.message(Command("all_deadlines"), StateFilter(None))
+async def command_all_deadlines(ms: Message, session: AsyncSession):
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    await send_deadlines(ms, session, today)
+
+
+async def send_deadlines(
+    ms: Message, session: AsyncSession, start: date, end: date | None = None
+):
+    if ms.from_user is None:
+        return
     try:
         group = await session.scalar(
             select(Group)
@@ -55,17 +70,19 @@ async def command_deadlines(ms: Message, session: AsyncSession):
         if group is None:
             await ms.answer("Сначала укажи свою учебную группу.")
             return
-        deadlines = list(await session.scalars(
+        query = (
             select(Deadline)
             .where(
                 Deadline.group_id == group.id,
                 Deadline.date >= start,
-                Deadline.date <= end,
             )
             .order_by(Deadline.date, Deadline.subject, Deadline.id)
-        ))
+        )
+        if end is not None:
+            query = query.where(Deadline.date <= end)
+        deadlines = list(await session.scalars(query))
     except Exception:
-        logger.exception("Failed to load weekly deadlines")
+        logger.exception("Failed to load deadlines")
         await ms.answer("Не удалось загрузить дедлайны. Попробуй позже.")
         return
     await ms.answer_rich(InputRichMessage(
