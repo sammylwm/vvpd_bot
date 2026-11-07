@@ -41,7 +41,11 @@ async def command_delete_deadline(ms: Message, session: AsyncSession):
         )
 
 
-@router.callback_query(F.data.startswith("delete_ask:") | F.data.startswith("delete_yes:") | F.data == "delete_no")
+@router.callback_query(
+    F.data.startswith("delete_ask:")
+    | F.data.startswith("delete_yes:")
+    | (F.data == "delete_no")
+)
 async def delete_deadline(callback: CallbackQuery, session: AsyncSession):
     ms = callback.message
     if not isinstance(ms, Message):

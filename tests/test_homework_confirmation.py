@@ -3,11 +3,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from bot.handlers.add import AddDeadline, confirm_deadline, parse_deadline
-from bot.handlers.delete import delete_deadline
+from bot.handlers.delete import delete_deadline, router as delete_router
 from aiogram.types import Message
 
 
 class HomeworkConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    def test_delete_buttons_reach_handler(self):
+        button_filter = delete_router.callback_query.handlers[0].filters[0].callback
+        for data in ("delete_ask:123", "delete_yes:123", "delete_no"):
+            with self.subTest(data=data):
+                self.assertTrue(button_filter(SimpleNamespace(data=data)))
+        for data in ("profile:123", "add_yes:123", None):
+            with self.subTest(data=data):
+                self.assertFalse(button_filter(SimpleNamespace(data=data)))
+
     async def test_parsing_only_previews_without_saving(self):
         ms = AsyncMock()
         state = AsyncMock()
