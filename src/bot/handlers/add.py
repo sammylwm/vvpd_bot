@@ -4,12 +4,13 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
+from uuid import uuid4
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from openai import APIError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 class AddDeadline(StatesGroup):
     waiting_for_text = State()
     waiting_for_subject = State()
+    waiting_for_confirmation = State()
 
 
 @router.message(Command("deadline"), StateFilter(None, AddDeadline))
@@ -177,10 +179,51 @@ async def parse_deadline(
             "Не удалось определить дату или задание. Отправь полный текст дедлайна с датой ещё раз."
         )
         return
+    token = uuid4().hex
+    await state.update_data(homework=homework, confirmation_token=token)
+    await state.set_state(AddDeadline.waiting_for_confirmation)
+    await ms.answer(
+        f"Подтвердить добавление ДЗ?\n"
+        f"Предмет: {escape(homework['subject'])}\n"
+        f"Дата: {escape(homework['date'])}\n"
+        f"Задание: {escape(homework['homework'])}\n"
+        f"Вложений: {len((await state.get_data()).get('attachments', []))}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Подтвердить", callback_data=f"add_yes:{token}"),
+            InlineKeyboardButton(text="Отмена", callback_data=f"add_no:{token}"),
+        ]]),
+    )
+
+
+@router.callback_query(F.data.startswith("add_yes:") | F.data.startswith("add_no:"))
+async def confirm_deadline(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    if (await state.get_state() != AddDeadline.waiting_for_confirmation.state
+            or callback.data.split(":", 1)[1] != data.get("confirmation_token")):
+        await callback.answer("Это подтверждение уже неактуально.")
+        return
+    await callback.answer()
+    ms = callback.message
+    if not isinstance(ms, Message):
+        return
+    if callback.data.startswith("add_no:"):
+        await state.clear()
+        await ms.edit_reply_markup(reply_markup=None)
+        await ms.answer("Добавление дедлайна отменено.")
+        return
+    # Resolve membership again: the group may have changed since the preview.
+    group = await session.scalar(
+        select(Group.name).join(User, User.group_id == Group.id)
+        .where(User.telegram_id == callback.from_user.id)
+    )
+    if group != data.get("group"):
+        await state.clear()
+        await ms.answer("Группа изменилась. Начни добавление заново: /deadline.")
+        return
     try:
-        data = await state.get_data()
         result = await save_deadline(
-            session, group, homework, data.get("attachments", [])
+            session, group, data["homework"], data.get("attachments", [])
         )
     except APIError:
         logger.exception("AI duplicate check is unavailable")
@@ -197,6 +240,7 @@ async def parse_deadline(
         return
 
     await state.clear()
+    await ms.edit_reply_markup(reply_markup=None)
     if result.status == "unchanged":
         await ms.answer("Такой дедлайн уже есть у твоей группы. Повторно не добавляю.")
         return

@@ -10,12 +10,12 @@ from aiogram.types import InputRichMessage, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.attachments import send_deadline_attachments
+from bot.handlers.deadline_buttons import deadline_button
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
 
-from .day import get_day_schedule, markdown_text, subject_key
+from .day import get_day_schedule, markdown_text
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -54,21 +54,16 @@ def render_week(
         "Суббота",
     )
     by_date = {date.fromisoformat(item["date"]): item["lessons"] for item in schedules}
-    tasks_by_date = {day: [] for day in days}
-    for task in deadlines:
-        if task.date in tasks_by_date:
-            tasks_by_date[task.date].append(task)
     parts = [
         "# 🗓 Твоя учебная неделя",
         f"## {days[0]:%d.%m.%Y} — {days[-1]:%d.%m.%Y}",
         f"🎓 **Группа {markdown_text(group)}**",
-        f"📚 Занятий: **{sum(len(by_date.get(day, [])) for day in days)}** · 📝 Заданий: **{sum(map(len, tasks_by_date.values()))}**",
+        f"📚 Занятий: **{sum(len(by_date.get(day, [])) for day in days)}**",
         "---",
     ]
     headers = ["Пара"] + [f"{names[day.weekday()]} {day:%d.%m}" for day in days]
     rows = ["| " + " | ".join(headers) + " |", "| :---: | " + " :--- |" * 6]
     pairs = sorted({lesson["pair"] for day in days for lesson in by_date.get(day, [])})
-    attached = {day: set() for day in days}
     for pair in pairs:
         cells = [f"**{pair}**"]
         for day in days:
@@ -90,40 +85,13 @@ def render_week(
                 details.append(
                     f"📍 {markdown_text(', '.join(lesson.get('rooms') or []) or 'Не указана')}"
                 )
-                key = subject_key(lesson["subject"])
-                for index, task in enumerate(tasks_by_date[day]):
-                    if index not in attached[day] and subject_key(task.subject) == key:
-                        details.append(f"📝 {markdown_text(task.deadline)}")
-                        attached[day].add(index)
                 blocks.append(" · ".join(details))
             cells.append(" / ".join(blocks) or "—")
         rows.append("| " + " | ".join(cells) + " |")
     if not pairs:
         rows.append("| Занятия | " + " | ".join("☕ Нет пар" for _ in days) + " |")
-    # Keep deadlines visible even if their subject has no lesson on that date.
-    remaining = [
-        [
-            task
-            for index, task in enumerate(tasks_by_date[day])
-            if index not in attached[day]
-        ]
-        for day in days
-    ]
-    if any(remaining):
-        cells = ["**📝 Другие задания**"]
-        for tasks in remaining:
-            cells.append(
-                " · ".join(
-                    f"**{markdown_text(task.subject)}**: {markdown_text(task.deadline)}"
-                    for task in tasks
-                )
-                or "—"
-            )
-        rows.append("| " + " | ".join(cells) + " |")
     parts.append("\n".join(rows))
     parts.append("---")
-    if not any(tasks_by_date.values()):
-        parts.append("> ✅ Заданий на эту неделю пока нет.")
     return "\n\n".join(parts)
 
 
@@ -162,24 +130,7 @@ async def command_week(ms: Message, command: CommandObject, session: AsyncSessio
             "Не удалось получить расписание на неделю. Сервис недоступен или вернул ошибку. Попробуй позже."
         )
         return
-    try:
-        deadlines = list(
-            await session.scalars(
-                select(Deadline)
-                .where(
-                    Deadline.group_id == group.id,
-                    Deadline.date >= days[0],
-                    Deadline.date <= days[-1],
-                )
-                .order_by(Deadline.date, Deadline.subject, Deadline.id)
-            )
-        )
-    except Exception:
-        logger.exception("Failed to load weekly deadlines")
-        await ms.answer("Не удалось загрузить задания из базы данных. Попробуй позже.")
-        return
     await ms.answer_rich(
-        InputRichMessage(markdown=render_week(group.name, days, schedules, deadlines))
+        InputRichMessage(markdown=render_week(group.name, days, schedules, [])),
+        reply_markup=deadline_button(group.id, days[0], days[-1]),
     )
-
-    await send_deadline_attachments(ms.bot, ms.chat.id, deadlines, ms.message_thread_id)

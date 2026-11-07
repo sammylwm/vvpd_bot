@@ -14,7 +14,7 @@ from aiogram.types import InputRichMessage, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.attachments import send_deadline_attachments
+from bot.handlers.deadline_buttons import deadline_button
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -39,12 +39,13 @@ async def command_reminder(ms: Message, session: AsyncSession):
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
-    messages, tasks = await build_reminder_payload(
-        group.id, group.name, datetime.now(ZoneInfo("Europe/Moscow")).date()
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    messages, _ = await build_reminder_payload(
+        group.id, group.name, today
     )
     for message in messages:
-        await ms.answer_rich(InputRichMessage(markdown=message))
-    await send_deadline_attachments(ms.bot, ms.chat.id, tasks, ms.message_thread_id)
+        await ms.answer_rich(InputRichMessage(markdown=message),
+                             reply_markup=deadline_button(group.id, today, today + timedelta(days=1)))
 
 
 def get_day_schedule(
@@ -97,7 +98,7 @@ def render_day(group: str, schedule: dict, deadlines: list[Deadline]) -> str:
         "# 🗓 Твой учебный день",
         f"## {day:%d.%m.%Y} · {weekdays[day.weekday()].capitalize()}",
         f"🎓 **Группа {markdown_text(group)}**",
-        f"📚 Занятий: **{len(lessons)}** · 📝 Заданий: **{len(deadlines)}**",
+        f"📚 Занятий: **{len(lessons)}**",
         "---",
         "## 📚 Расписание занятий",
     ]
@@ -122,34 +123,6 @@ def render_day(group: str, schedule: dict, deadlines: list[Deadline]) -> str:
     else:
         parts.append("> ☕ На эту дату занятий нет.")
 
-    parts.extend(["---", "## 📝 Задания к этому дню"])
-    tasks_by_subject = {}
-    for task in deadlines:
-        tasks_by_subject.setdefault(subject_key(task.subject), []).append(task)
-
-    shown_subjects = set()
-    for lesson in lessons:
-        key = subject_key(lesson["subject"])
-        if key in shown_subjects or key not in tasks_by_subject:
-            continue
-        tasks = tasks_by_subject[key]
-        parts.append(f"### 📖 {markdown_text(tasks[0].subject)}")
-        parts.append("\n".join(f"- {markdown_text(task.deadline)}" for task in tasks))
-        shown_subjects.add(key)
-
-    other_tasks = [
-        task for task in deadlines if subject_key(task.subject) not in shown_subjects
-    ]
-    if other_tasks:
-        parts.append("### 📌 По предметам без пар в этот день")
-        parts.append(
-            "\n".join(
-                f"- **{markdown_text(task.subject)}** — {markdown_text(task.deadline)}"
-                for task in other_tasks
-            )
-        )
-    if not deadlines:
-        parts.append("> ✅ Заданий на эту дату пока нет.")
     parts.append("---")
     return "\n\n".join(parts)
 
@@ -197,23 +170,7 @@ async def command_day(ms: Message, command: CommandObject, session: AsyncSession
             "Не удалось получить расписание: сервис недоступен или вернул ошибку. Попробуй позже."
         )
         return
-    try:
-        deadlines = list(
-            await session.scalars(
-                select(Deadline)
-                .where(
-                    Deadline.group_id == group.id,
-                    Deadline.date == schedule_day,
-                )
-                .order_by(Deadline.subject, Deadline.id)
-            )
-        )
-    except Exception:
-        logger.exception("Failed to load daily deadlines")
-        await ms.answer("Не удалось загрузить задания из базы данных. Попробуй позже.")
-        return
     await ms.answer_rich(
-        InputRichMessage(markdown=render_day(group.name, schedule, deadlines))
+        InputRichMessage(markdown=render_day(group.name, schedule, [])),
+        reply_markup=deadline_button(group.id, schedule_day, schedule_day),
     )
-
-    await send_deadline_attachments(ms.bot, ms.chat.id, deadlines, ms.message_thread_id)
