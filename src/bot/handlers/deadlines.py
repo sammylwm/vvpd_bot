@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.attachments import send_deadline_attachments
+from bot.identity import account_id
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -66,7 +67,7 @@ async def send_deadlines(
         group = await session.scalar(
             select(Group)
             .join(User, User.group_id == Group.id)
-            .where(User.telegram_id == ms.from_user.id)
+            .where(User.telegram_id == account_id(ms, ms.from_user.id))
         )
         if group is None:
             await ms.answer("Сначала укажи свою учебную группу.")

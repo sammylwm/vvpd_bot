@@ -9,6 +9,7 @@ from aiogram.types import InputRichMessage, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.identity import account_id
 from core.modules.group import Group
 from core.modules.user import User
 
@@ -42,10 +43,10 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
             session.add(db_group)
 
         user = await session.scalar(
-            select(User).where(User.telegram_id == ms.from_user.id)
+            select(User).where(User.telegram_id == account_id(ms, ms.from_user.id))
         )
         if user is None:
-            session.add(User(telegram_id=ms.from_user.id, group=db_group))
+            session.add(User(telegram_id=account_id(ms, ms.from_user.id), group=db_group))
         else:
             user.group = db_group
 

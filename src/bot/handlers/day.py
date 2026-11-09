@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.handlers.deadline_buttons import deadline_button
+from bot.identity import account_id
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -34,7 +35,7 @@ async def command_reminder(ms: Message, session: AsyncSession):
     group = await session.scalar(
         select(Group)
         .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == ms.from_user.id)
+        .where(User.telegram_id == account_id(ms, ms.from_user.id))
     )
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
@@ -155,7 +156,7 @@ async def command_day(ms: Message, command: CommandObject, session: AsyncSession
     group = await session.scalar(
         select(Group)
         .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == ms.from_user.id)
+        .where(User.telegram_id == account_id(ms, ms.from_user.id))
     )
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")

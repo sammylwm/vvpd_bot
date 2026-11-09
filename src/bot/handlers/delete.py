@@ -7,6 +7,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.identity import account_id
 from core.modules.deadline import Deadline
 from core.modules.user import User
 
@@ -23,7 +24,7 @@ async def command_delete_deadline(ms: Message, session: AsyncSession):
     if ms.from_user is None:
         return
     deadlines = list(await session.scalars(
-        select(Deadline).where(Deadline.group_id == group_for_user(ms.from_user.id))
+        select(Deadline).where(Deadline.group_id == group_for_user(account_id(ms, ms.from_user.id)))
         .order_by(Deadline.date, Deadline.subject, Deadline.id)
     ))
     if not deadlines:
@@ -60,7 +61,7 @@ async def delete_deadline(callback: CallbackQuery, session: AsyncSession):
     except ValueError:
         await callback.answer("Некорректное задание.")
         return
-    condition = (Deadline.id == deadline_id, Deadline.group_id == group_for_user(callback.from_user.id))
+    condition = (Deadline.id == deadline_id, Deadline.group_id == group_for_user(account_id(ms, callback.from_user.id)))
     try:
         if callback.data.startswith("delete_ask:"):
             task = await session.scalar(select(Deadline).where(*condition))

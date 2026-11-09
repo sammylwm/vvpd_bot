@@ -14,6 +14,7 @@ from core.db_helper import async_session_maker
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
+from core.modules.telegram_chat import TelegramChat
 
 logger = logging.getLogger(__name__)
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -68,6 +69,13 @@ async def send_reminders(bot: Bot) -> None:
 
     messages_by_group: dict[int, tuple[list[str], list[Deadline]]] = {}
     for user_id, group_id, group_name in users:
+        topic_options = {}
+        if user_id < 0:
+            async with async_session_maker() as session:
+                chat = await session.get(TelegramChat, user_id)
+                if chat is None or not chat.active or chat.topic_id is None:
+                    continue
+                topic_options["message_thread_id"] = chat.topic_id
         if group_id not in messages_by_group:
             messages_by_group[group_id] = await build_reminder_payload(
                 group_id, group_name, today
@@ -80,7 +88,8 @@ async def send_reminders(bot: Bot) -> None:
                 try:
                     await bot.send_rich_message(
                         user_id, InputRichMessage(markdown=message),
-                        reply_markup=deadline_button(group_id, today, today + timedelta(days=1))
+                        reply_markup=deadline_button(group_id, today, today + timedelta(days=1)),
+                        **topic_options,
                     )
                 except TelegramRetryAfter as exc:
                     await asyncio.sleep(exc.retry_after)

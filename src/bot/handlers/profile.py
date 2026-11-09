@@ -17,6 +17,7 @@ from aiogram.types import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.identity import account_id
 from core.modules.group import Group
 from core.modules.user import User
 
@@ -78,7 +79,7 @@ async def load_profile(session: AsyncSession, telegram_id: int):
 async def command_profile(ms: Message, session: AsyncSession):
     if ms.from_user is None:
         return
-    profile = await load_profile(session, ms.from_user.id)
+    profile = await load_profile(session, account_id(ms, ms.from_user.id))
     if profile is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
@@ -88,7 +89,7 @@ async def command_profile(ms: Message, session: AsyncSession):
 @router.callback_query(F.data.startswith("profile:"))
 async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSession):
     _, action, owner = (cb.data or "").split(":", 2)
-    if owner != str(cb.from_user.id):
+    if owner != str(account_id(cb.message, cb.from_user.id)):
         await cb.answer(
             "Это профиль другого пользователя. Открой свой через /profile.",
             show_alert=True,
@@ -102,7 +103,7 @@ async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSes
             "Сначала заверши текущий ввод или отправь /cancel.", show_alert=True
         )
         return
-    profile = await load_profile(session, cb.from_user.id)
+    profile = await load_profile(session, account_id(cb.message, cb.from_user.id))
     if profile is None:
         await cb.answer("Сначала укажи свою учебную группу.", show_alert=True)
         return
@@ -148,7 +149,7 @@ async def change_group(ms: Message, state: FSMContext, session: AsyncSession):
     if re.fullmatch(r"[0-9]{3}-[0-9]{3}", name) is None:
         await ms.answer("Отправь номер группы в формате 261-329. Отмена: /cancel")
         return
-    user = await session.scalar(select(User).where(User.telegram_id == ms.from_user.id))
+    user = await session.scalar(select(User).where(User.telegram_id == account_id(ms, ms.from_user.id)))
     if user is None:
         await state.clear()
         await ms.answer("Сначала укажи свою учебную группу через /start.")
@@ -180,7 +181,7 @@ async def change_time(ms: Message, state: FSMContext, session: AsyncSession):
             "Введи время в формате hh:mm от 00:00 до 23:59, например 09:30. Отмена: /cancel"
         )
         return
-    profile = await load_profile(session, ms.from_user.id)
+    profile = await load_profile(session, account_id(ms, ms.from_user.id))
     if profile is None:
         await state.clear()
         await ms.answer("Сначала укажи свою учебную группу через /start.")

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai.ai import SubjectClarificationRequired, get_json_homework, reconcile_homework
 from bot.attachments import AlbumMiddleware, message_attachments
+from bot.identity import account_id
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -215,7 +216,7 @@ async def confirm_deadline(callback: CallbackQuery, state: FSMContext, session: 
     # Resolve membership again: the group may have changed since the preview.
     group = await session.scalar(
         select(Group.name).join(User, User.group_id == Group.id)
-        .where(User.telegram_id == callback.from_user.id)
+        .where(User.telegram_id == account_id(callback.message, callback.from_user.id))
     )
     if group != data.get("group"):
         await state.clear()
@@ -278,7 +279,7 @@ async def receive_deadline(
     group = await session.scalar(
         select(Group.name)
         .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == ms.from_user.id)
+        .where(User.telegram_id == account_id(ms, ms.from_user.id))
     )
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")

@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.attachments import send_deadline_attachments
+from bot.identity import account_id
 from core.modules.deadline import Deadline
 from core.modules.group import Group
 from core.modules.user import User
@@ -43,7 +44,7 @@ async def show_schedule_deadlines(callback: CallbackQuery, session: AsyncSession
     try:
         group = await session.scalar(
             select(Group).join(User, User.group_id == Group.id)
-            .where(User.telegram_id == callback.from_user.id, Group.id == group_id)
+            .where(User.telegram_id == account_id(callback.message, callback.from_user.id), Group.id == group_id)
         )
         if group is None:
             await callback.answer("Выбери расписание своей текущей группы.", show_alert=True)
