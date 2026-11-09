@@ -30,35 +30,45 @@ class Profile(StatesGroup):
 
 def render_profile(user: User, group: Group) -> InputRichMessage:
     enabled = user.reminders_enabled
-    return InputRichMessage(blocks=[
-        InputRichBlockSectionHeading(text="👤 Твой профиль", size=1),
-        InputRichBlockParagraph(text=f"🎓 Группа: {group.name}"),
-        InputRichBlockParagraph(text=(
-            f"⏰ Уведомления включены: ежедневно в {user.reminder_time:%H:%M} по Москве."
-            if enabled else "🔕 Напоминания отключены."
-        )),
-        InputRichBlockButtons(buttons=[
-            RichMessageButton(
-                text="✏️ Изменить группу",
-                callback_data=f"profile:group:{user.telegram_id}",
+    return InputRichMessage(
+        blocks=[
+            InputRichBlockSectionHeading(text="👤 Твой профиль", size=1),
+            InputRichBlockParagraph(text=f"🎓 Группа: {group.name}"),
+            InputRichBlockParagraph(
+                text=(
+                    f"⏰ Уведомления включены: ежедневно в {user.reminder_time:%H:%M} по Москве."
+                    if enabled
+                    else "🔕 Напоминания отключены."
+                )
             ),
-        ]),
-        InputRichBlockButtons(buttons=[
-            RichMessageButton(
-                text=f"⏰ Время уведомления: {user.reminder_time:%H:%M}",
-                callback_data=f"profile:time:{user.telegram_id}",
+            InputRichBlockButtons(
+                buttons=[
+                    RichMessageButton(
+                        text="✏️ Изменить группу",
+                        callback_data=f"profile:group:{user.telegram_id}",
+                    ),
+                ]
             ),
-            RichMessageButton(
-                text="🔔 Включено" if enabled else "🔕 Выключено",
-                callback_data=f"profile:{'off' if enabled else 'on'}:{user.telegram_id}",
+            InputRichBlockButtons(
+                buttons=[
+                    RichMessageButton(
+                        text=f"⏰ Время: {user.reminder_time:%H:%M}",
+                        callback_data=f"profile:time:{user.telegram_id}",
+                    ),
+                    RichMessageButton(
+                        text="🔔 Включено" if enabled else "🔕 Выключено",
+                        callback_data=f"profile:{'off' if enabled else 'on'}:{user.telegram_id}",
+                    ),
+                ]
             ),
-        ]),
-    ])
+        ]
+    )
 
 
 async def load_profile(session: AsyncSession, telegram_id: int):
     result = await session.execute(
-        select(User, Group).join(Group, User.group_id == Group.id)
+        select(User, Group)
+        .join(Group, User.group_id == Group.id)
         .where(User.telegram_id == telegram_id)
     )
     return result.first()
@@ -79,13 +89,18 @@ async def command_profile(ms: Message, session: AsyncSession):
 async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSession):
     _, action, owner = (cb.data or "").split(":", 2)
     if owner != str(cb.from_user.id):
-        await cb.answer("Это профиль другого пользователя. Открой свой через /profile.", show_alert=True)
+        await cb.answer(
+            "Это профиль другого пользователя. Открой свой через /profile.",
+            show_alert=True,
+        )
         return
     if not isinstance(cb.message, Message):
         await cb.answer()
         return
     if await state.get_state() is not None:
-        await cb.answer("Сначала заверши текущий ввод или отправь /cancel.", show_alert=True)
+        await cb.answer(
+            "Сначала заверши текущий ввод или отправь /cancel.", show_alert=True
+        )
         return
     profile = await load_profile(session, cb.from_user.id)
     if profile is None:
@@ -94,15 +109,21 @@ async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSes
     if action == "group":
         await state.set_state(Profile.waiting_for_group)
         await cb.answer()
-        await cb.message.answer_rich(InputRichMessage(markdown=(
-            "# ✏️ Изменить группу\n\n"
-            "Отправь номер новой группы в формате **261-329**.\n\n"
-            "Отмена: /cancel"
-        )))
+        await cb.message.answer_rich(
+            InputRichMessage(
+                markdown=(
+                    "# ✏️ Изменить группу\n\n"
+                    "Отправь номер новой группы в формате **261-329**.\n\n"
+                    "Отмена: /cancel"
+                )
+            )
+        )
     elif action == "time":
         await state.set_state(Profile.waiting_for_time)
         await cb.answer()
-        await cb.message.answer("Отправь время уведомления в формате hh:mm, например 09:30. Часовой пояс: Москва. Отмена: /cancel")
+        await cb.message.answer(
+            "Отправь время уведомления в формате hh:mm, например 09:30. Часовой пояс: Москва. Отмена: /cancel"
+        )
     elif action in ("on", "off"):
         user, group = profile
         user.reminders_enabled = action == "on"
@@ -155,7 +176,9 @@ async def change_time(ms: Message, state: FSMContext, session: AsyncSession):
         return
     value = (ms.text or "").strip()
     if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value) is None:
-        await ms.answer("Введи время в формате hh:mm от 00:00 до 23:59, например 09:30. Отмена: /cancel")
+        await ms.answer(
+            "Введи время в формате hh:mm от 00:00 до 23:59, например 09:30. Отмена: /cancel"
+        )
         return
     profile = await load_profile(session, ms.from_user.id)
     if profile is None:
