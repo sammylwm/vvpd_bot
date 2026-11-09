@@ -52,8 +52,7 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
     await state.clear()
     await ms.answer(
         f"✅ <b>Группа указана!</b>\n\n🎓 Твоя группа: <b>{escape(group)}</b>\n\n"
-        "Настройка утренних напоминаний: /reminders\n"
-        "Отключить: /reminders off · Включить: /reminders on",
+        "Время и статус уведомлений можно изменить кнопками в /profile.",
         parse_mode="HTML",
     )
 

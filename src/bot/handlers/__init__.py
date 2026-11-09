@@ -1,6 +1,6 @@
 from aiogram import Router
 
-from . import add, authorization, common, day, deadline_buttons, deadlines, delete, profile, reminder_settings, week
+from . import add, authorization, common, day, deadline_buttons, deadlines, delete, profile, week
 
 router = Router()
 router.include_routers(
@@ -11,7 +11,6 @@ router.include_routers(
     deadline_buttons.router,
     deadlines.router,
     delete.router,
-    reminder_settings.router,
     week.router,
     add.router,
 )
