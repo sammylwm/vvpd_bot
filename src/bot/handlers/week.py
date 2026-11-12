@@ -7,9 +7,9 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.types import (
-    CallbackQuery, InputRichBlockButtons, InputRichBlockDetails,
+    CallbackQuery, InputRichBlockButtons, InputRichBlockDetails, InputRichBlockDivider,
     InputRichBlockParagraph, InputRichBlockSectionHeading, InputRichMessage,
-    Message, RichMessageButton,
+    Message, RichMessageButton, RichTextBold,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def week_dates(day: date) -> list[date]:
     monday = day - timedelta(days=day.weekday())
-    return [monday + timedelta(days=offset) for offset in range(7)]
+    return [monday + timedelta(days=offset) for offset in range(6)]
 
 
 async def get_week_schedule(group: str, days: list[date]) -> list[dict]:
@@ -51,48 +51,58 @@ def render_week(
     group: str, days: list[date], schedules: list[dict], deadlines: list[Deadline],
     *, owner: int = 0, selected: int | None = None,
 ) -> InputRichMessage:
-    names = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье")
-    short_names = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    names = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота")
+    short_names = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб")
     by_date = {date.fromisoformat(item["date"]): item["lessons"] for item in schedules}
     prefix = f"week:{owner}:{days[0].isoformat()}"
     subgroup = next((item.get("subgroup") for item in schedules if item.get("subgroup")), None)
     blocks = [
-        InputRichBlockSectionHeading(text="Неделя", size=1),
-        InputRichBlockParagraph(text=f"{days[0]:%d.%m}-{days[-1]:%d.%m.%Y}"),
+        InputRichBlockSectionHeading(text="🗓 Неделя", size=1),
+        InputRichBlockSectionHeading(text=f"{days[0]:%d.%m} - {days[-1]:%d.%m.%Y}", size=2),
         InputRichBlockParagraph(text=f"Группа {group}" + (f" · подгруппа {subgroup}" if subgroup else "")),
     ]
     buttons = [RichMessageButton(text=f"{short_names[day.weekday()]} {day.day}",
-                                callback_data=f"{prefix}:day{index}")
+                                callback_data=f"{prefix}:day{index}",
+                                style="danger" if selected == index else None)
                for index, day in enumerate(days)]
     blocks.extend(InputRichBlockButtons(buttons=buttons[start:start + count], align="center")
-                  for start, count in ((0, 4), (4, 3)))
+                  for start, count in ((0, 3), (3, 3)))
     blocks.append(InputRichBlockButtons(buttons=[RichMessageButton(
-        text="Вся неделя", callback_data=f"{prefix}:all")], align="center"))
+        text="Вся неделя", callback_data=f"{prefix}:all",
+        style="danger" if selected is None else None)], align="center"))
+    blocks.append(InputRichBlockDivider())
     for index, day in enumerate(days):
         if selected is not None and selected != index:
             continue
         lessons = sorted(by_date.get(day, []), key=lambda lesson: (lesson["start"], lesson["subject"]))
         contents = []
-        for lesson in lessons:
-            contents.append(InputRichBlockSectionHeading(text=f"{lesson['start']}-{lesson['end']}", size=3))
+        for lesson_index, lesson in enumerate(lessons):
+            if lesson_index:
+                contents.append(InputRichBlockDivider())
+            contents.append(InputRichBlockSectionHeading(
+                text=RichTextBold(text=f"🕒 {lesson['start']} - {lesson['end']}"), size=3,
+            ))
             subject = lesson["subject"]
             if lesson.get("type"):
                 subject += f" ({lesson['type']})"
-            contents.append(InputRichBlockParagraph(text=subject))
+            contents.append(InputRichBlockParagraph(text=RichTextBold(text=subject)))
             if lesson.get("teacher"):
-                contents.append(InputRichBlockParagraph(text=f"Преподаватель: {lesson['teacher']}"))
+                contents.append(InputRichBlockParagraph(text=f"👤 Преподаватель: {lesson['teacher']}"))
             if lesson.get("rooms"):
-                contents.append(InputRichBlockParagraph(text=f"Аудитория: {', '.join(lesson['rooms'])}"))
+                contents.append(InputRichBlockParagraph(text=RichTextBold(
+                    text=f"📍 Аудитория: {', '.join(lesson['rooms'])}",
+                )))
             link = lesson.get("url") or lesson.get("link")
             if isinstance(link, str) and link.startswith(("https://", "http://")):
                 contents.append(InputRichBlockButtons(buttons=[RichMessageButton(text="Подключиться", url=link)]))
         if not lessons:
-            contents.append(InputRichBlockParagraph(text="Занятий нет"))
+            contents.append(InputRichBlockParagraph(text="☕ Занятий нет"))
         count = f"занятий: {len(lessons)}" if lessons else "нет занятий"
         blocks.append(InputRichBlockDetails(
             summary=f"{names[day.weekday()]}, {day:%d.%m} · {count}",
             blocks=contents, is_open=selected is not None,
         ))
+    blocks.append(InputRichBlockDivider())
     blocks.append(InputRichBlockButtons(buttons=[
         RichMessageButton(text="‹", callback_data=f"{prefix}:prev"),
         RichMessageButton(text="Эта неделя", callback_data=f"{prefix}:today"),
@@ -112,7 +122,7 @@ async def week_action(callback: CallbackQuery, session: AsyncSession):
         _, owner, first, action = (callback.data or "").split(":")
         owner = int(owner)
         day = date.fromisoformat(first)
-        if action not in {"prev", "next", "today", "close", "all", *(f"day{i}" for i in range(7))}:
+        if action not in {"prev", "next", "today", "close", "all", *(f"day{i}" for i in range(6))}:
             raise ValueError("Invalid action")
     except ValueError:
         await callback.answer("Некорректная кнопка.")

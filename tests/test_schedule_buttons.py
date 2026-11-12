@@ -20,15 +20,15 @@ class ScheduleButtonsTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("СЕКРЕТНОЕ", text)
             self.assertNotIn("Заданий:", text)
 
-    def test_week_has_seven_collapsed_days_and_navigation(self):
+    def test_week_has_six_collapsed_days_and_navigation(self):
         days = week_dates(date(2026, 11, 12))
-        self.assertEqual(len(days), 7)
-        self.assertEqual(days[-1], date(2026, 11, 15))
+        self.assertEqual(len(days), 6)
+        self.assertEqual(days[-1], date(2026, 11, 14))
         message = render_week("261-329", days, [], [], owner=42)
         details = [block for block in message.blocks if block.type == "details"]
-        self.assertEqual(len(details), 7)
+        self.assertEqual(len(details), 6)
         self.assertTrue(all(block.is_open is False for block in details))
-        self.assertEqual(details[-1].summary, "Воскресенье, 15.11 · нет занятий")
+        self.assertEqual(details[-1].summary, "Суббота, 14.11 · нет занятий")
         self.assertIn("week:42:2026-11-09:next", message.model_dump_json())
 
     def test_selected_day_shows_sorted_lessons_and_link(self):
