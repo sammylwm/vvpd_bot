@@ -47,6 +47,40 @@ async def get_week_schedule(group: str, days: list[date]) -> list[dict]:
     return results
 
 
+def lesson_blocks(lessons: list[dict], *, show_dates: bool = False) -> list:
+    contents = []
+    for lesson_index, lesson in enumerate(lessons):
+        if lesson_index:
+            contents.append(InputRichBlockDivider())
+        contents.append(InputRichBlockSectionHeading(
+            text=RichTextBold(text=f"🕒 {lesson['start']} - {lesson['end']}"), size=3,
+        ))
+        subject = lesson["subject"]
+        if lesson.get("type"):
+            subject += f" ({lesson['type']})"
+        contents.append(InputRichBlockParagraph(text=RichTextBold(text=subject)))
+        if show_dates:
+            if lesson.get("date"):
+                period = date.fromisoformat(lesson["date"]).strftime("%d.%m.%Y")
+            else:
+                first = date.fromisoformat(lesson["date_from"]).strftime("%d.%m.%Y") if lesson.get("date_from") else None
+                last = date.fromisoformat(lesson["date_to"]).strftime("%d.%m.%Y") if lesson.get("date_to") else None
+                period = f"{first} - {last}" if first and last else (f"С {first}" if first else f"До {last}" if last else "Период не указан")
+            contents.append(InputRichBlockParagraph(text=f"📅 {period}"))
+        if lesson.get("teacher"):
+            contents.append(InputRichBlockParagraph(text=f"👤 Преподаватель: {lesson['teacher']}"))
+        if lesson.get("rooms"):
+            contents.append(InputRichBlockParagraph(text=RichTextBold(
+                text=f"📍 Аудитория: {', '.join(lesson['rooms'])}",
+            )))
+        link = lesson.get("url") or lesson.get("link")
+        if isinstance(link, str) and link.startswith(("https://", "http://")):
+            contents.append(InputRichBlockButtons(buttons=[RichMessageButton(text="Подключиться", url=link)]))
+    if not lessons:
+        contents.append(InputRichBlockParagraph(text="☕ Занятий нет"))
+    return contents
+
+
 def render_week(
     group: str, days: list[date], schedules: list[dict], deadlines: list[Deadline],
     *, owner: int = 0, selected: int | None = None,
@@ -75,28 +109,7 @@ def render_week(
         if selected is not None and selected != index:
             continue
         lessons = sorted(by_date.get(day, []), key=lambda lesson: (lesson["start"], lesson["subject"]))
-        contents = []
-        for lesson_index, lesson in enumerate(lessons):
-            if lesson_index:
-                contents.append(InputRichBlockDivider())
-            contents.append(InputRichBlockSectionHeading(
-                text=RichTextBold(text=f"🕒 {lesson['start']} - {lesson['end']}"), size=3,
-            ))
-            subject = lesson["subject"]
-            if lesson.get("type"):
-                subject += f" ({lesson['type']})"
-            contents.append(InputRichBlockParagraph(text=RichTextBold(text=subject)))
-            if lesson.get("teacher"):
-                contents.append(InputRichBlockParagraph(text=f"👤 Преподаватель: {lesson['teacher']}"))
-            if lesson.get("rooms"):
-                contents.append(InputRichBlockParagraph(text=RichTextBold(
-                    text=f"📍 Аудитория: {', '.join(lesson['rooms'])}",
-                )))
-            link = lesson.get("url") or lesson.get("link")
-            if isinstance(link, str) and link.startswith(("https://", "http://")):
-                contents.append(InputRichBlockButtons(buttons=[RichMessageButton(text="Подключиться", url=link)]))
-        if not lessons:
-            contents.append(InputRichBlockParagraph(text="☕ Занятий нет"))
+        contents = lesson_blocks(lessons)
         count = f"занятий: {len(lessons)}" if lessons else "нет занятий"
         blocks.append(InputRichBlockDetails(
             summary=f"{names[day.weekday()]}, {day:%d.%m} · {count}",
