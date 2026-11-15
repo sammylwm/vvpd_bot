@@ -58,11 +58,11 @@ async def user_group(session: AsyncSession, ms: Message, user_id: int):
     )
 
 
-def render_session(group: str, key: str, tasks: list[SessionTask], owner: int) -> InputRichMessage:
+def render_session(group: str, key: str, tasks: list[SessionTask], owner: int, deletion: bool = False) -> InputRichMessage:
     blocks = [
         InputRichBlockSectionHeading(text="📚 Подготовка к сессии", size=1),
         InputRichBlockParagraph(text=f"{semester_title(key)} · Группа {group}"),
-        InputRichBlockParagraph(text="Задания до сессии для всей группы. Добавить: /session_add"),
+        InputRichBlockParagraph(text="Задания до сессии для всей группы. Добавить: /session_add. Удалить: /session_delete"),
     ]
     subjects = {}
     for task in tasks:
@@ -74,37 +74,44 @@ def render_session(group: str, key: str, tasks: list[SessionTask], owner: int) -
                 contents.append(InputRichBlockDivider())
             contents.append(InputRichBlockParagraph(text=RichTextBold(text=task.text)))
             contents.append(InputRichBlockParagraph(text=f"Срок: {task.due_date:%d.%m.%Y}" if task.due_date else "Без срока"))
-            contents.append(InputRichBlockButtons(buttons=[RichMessageButton(
-                text="Удалить", style="danger",
-                callback_data=f"session_delete:ask:{owner}:{key}:{task.id}",
-            )]))
+            if deletion:
+                contents.append(InputRichBlockButtons(buttons=[RichMessageButton(
+                    text="Удалить", style="danger",
+                    callback_data=f"session_delete:ask:{owner}:{key}:{task.id}",
+                )]))
         blocks.append(InputRichBlockDetails(summary=f"{subject} · заданий: {len(items)}", blocks=contents, is_open=True))
     if not tasks:
         blocks.append(InputRichBlockParagraph(text="Требований пока нет. Добавь первое через /session_add."))
     return InputRichMessage(blocks=blocks)
 
 
-async def session_view(session: AsyncSession, group: Group, key: str, owner: int):
+async def session_view(session: AsyncSession, group: Group, key: str, owner: int, deletion: bool = False):
     tasks = list(await session.scalars(
         select(SessionTask).where(SessionTask.group_id == group.id, SessionTask.semester == key)
         .order_by(SessionTask.subject, SessionTask.due_date.asc().nulls_last(), SessionTask.id)
     ))
-    return render_session(group.name, key, tasks, owner)
+    return render_session(group.name, key, tasks, owner, deletion)
 
 
 @router.message(Command("session"), StateFilter(None))
-async def command_session(ms: Message, command: CommandObject, session: AsyncSession):
+async def command_session(ms: Message, command: CommandObject, session: AsyncSession, deletion: bool = False):
     if ms.from_user is None:
         return
     key = (command.args or current_semester()).strip()
     if re.fullmatch(r"[0-9]{4}-[12]", key) is None:
-        await ms.answer("Используй /session или /session 2026-2. 1 - весна, 2 - осень и следующая зима.")
+        name = "session_delete" if deletion else "session"
+        await ms.answer(f"Используй /{name} или /{name} 2026-2. 1 - весна, 2 - осень и следующая зима.")
         return
     group = await user_group(session, ms, ms.from_user.id)
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
-    await ms.answer_rich(await session_view(session, group, key, ms.from_user.id))
+    await ms.answer_rich(await session_view(session, group, key, ms.from_user.id, deletion))
+
+
+@router.message(Command("session_delete"), StateFilter(None))
+async def command_session_delete(ms: Message, command: CommandObject, session: AsyncSession):
+    await command_session(ms, command, session, deletion=True)
 
 
 @router.message(Command("session_add"), StateFilter(None))
@@ -287,7 +294,7 @@ async def delete_session_task(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("Некорректная кнопка.")
         return
     if owner != callback.from_user.id:
-        await callback.answer("Открой свой список через /session.", show_alert=True)
+        await callback.answer("Открой свой список через /session_delete.", show_alert=True)
         return
     if action == "no":
         await callback.answer("Удаление отменено.")

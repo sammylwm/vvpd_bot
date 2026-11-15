@@ -32,10 +32,27 @@ class SessionTasksTests(unittest.IsolatedAsyncioTestCase):
         tasks = [SessionTask(id=1, group_id=7, semester="2026-2", subject="Алгебра", text="Сдать расчёт", due_date=None),
                  SessionTask(id=2, group_id=7, semester="2026-2", subject="Алгебра", text="Закрыть контрольную", due_date=date(2026, 12, 20))]
         payload = render_session("261-329", "2026-2", tasks, 42).model_dump_json()
-        for value in ("Сдать расчёт", "Закрыть контрольную", "Без срока", "20.12.2026", "session_delete:ask:42:2026-2:1"):
+        for value in ("Сдать расчёт", "Закрыть контрольную", "Без срока", "20.12.2026"):
             self.assertIn(value, payload)
-        for value in ("Выполнено", "Вернуть в работу", "Отметить выполненным", "session_set:"):
+        for value in ("Выполнено", "Вернуть в работу", "Отметить выполненным", "session_set:", "session_delete:", '"type":"buttons"'):
             self.assertNotIn(value, payload)
+
+    def test_deletion_view_has_delete_buttons(self):
+        tasks = [SessionTask(id=1, group_id=7, semester="2026-2", subject="Алгебра", text="Сдать расчёт")]
+        payload = render_session("261-329", "2026-2", tasks, 42, deletion=True).model_dump_json()
+        self.assertIn("session_delete:ask:42:2026-2:1", payload)
+
+    async def test_delete_command_selects_semester_and_deletion_view(self):
+        from unittest.mock import patch
+        from aiogram.filters import CommandObject
+        from bot.handlers.session_tasks import command_session_delete
+        self.message.answer_rich = AsyncMock()
+        group = MagicMock(id=7)
+        self.session.scalar.return_value = group
+        with patch("bot.handlers.session_tasks.session_view", new=AsyncMock()) as view:
+            await command_session_delete(self.message, CommandObject(prefix="/", command="session_delete", args="2026-1"), self.session)
+        view.assert_awaited_once_with(self.session, group, "2026-1", 42, True)
+        self.message.answer_rich.assert_awaited_once()
 
     async def test_old_completion_button_only_shows_notice(self):
         callback = MagicMock(answer=AsyncMock())
