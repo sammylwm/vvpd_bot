@@ -32,20 +32,19 @@ def deadline_button(group_id: int, start: date, end: date) -> InlineKeyboardMark
                     callback_data=f"schedule_tasks:{group_id}:{start.isoformat()}:{end.isoformat()}",
                 ),
             ],
-            [InlineKeyboardButton(text="Скрыть", callback_data="hide_schedule")],
         ]
     )
 
 
-@router.callback_query(F.data == "hide_schedule")
-async def hide_schedule(callback: CallbackQuery):
+@router.callback_query(F.data == "hide_deadlines")
+async def hide_deadlines(callback: CallbackQuery):
     if not isinstance(callback.message, Message):
         await callback.answer()
         return
     try:
         await callback.message.delete()
     except TelegramAPIError:
-        logger.exception("Failed to hide schedule message")
+        logger.exception("Failed to hide deadlines message")
         await callback.answer("Не удалось удалить сообщение.", show_alert=True)
         return
     await callback.answer()
@@ -105,5 +104,12 @@ async def show_schedule_deadlines(callback: CallbackQuery, session: AsyncSession
         .replace("на эту неделю", "на эти даты")
     )
     ms = callback.message
-    await ms.answer_rich(InputRichMessage(markdown=text))
+    await ms.answer_rich(
+        InputRichMessage(markdown=text),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Скрыть", callback_data="hide_deadlines")],
+            ]
+        ),
+    )
     await send_deadline_attachments(ms.bot, ms.chat.id, tasks, ms.message_thread_id)
