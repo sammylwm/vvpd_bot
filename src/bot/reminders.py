@@ -8,13 +8,13 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import InputRichMessage
 from sqlalchemy import or_, select, update
 
-from bot.handlers.deadline_buttons import deadline_button
 from bot.handlers.day import get_day_schedule, markdown_text, render_day
+from bot.handlers.deadline_buttons import deadline_button
 from core.db_helper import async_session_maker
 from core.modules.deadline import Deadline
 from core.modules.group import Group
-from core.modules.user import User
 from core.modules.telegram_chat import TelegramChat
+from core.modules.user import User
 
 logger = logging.getLogger(__name__)
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -40,17 +40,23 @@ async def build_reminder_payload(
         message = render_day(group_name, schedule, [])
     except Exception:
         logger.exception("Failed to fetch schedule for group %s", group_name)
-        message = "Не удалось получить расписание на сегодня. Попробуй позже через /day."
+        message = (
+            "Не удалось получить расписание на сегодня. Попробуй позже через /day."
+        )
     return [message], []
 
 
-async def build_reminder_messages(group_id: int, group_name: str, today: date) -> list[str]:
+async def build_reminder_messages(
+    group_id: int, group_name: str, today: date
+) -> list[str]:
     messages, _ = await build_reminder_payload(group_id, group_name, today)
     return messages
 
 
 async def send_reminders(bot: Bot) -> None:
     now = datetime.now(MOSCOW)
+    if now.weekday() == 6:
+        return
     today = now.date()
     current_time = now.time().replace(second=0, microsecond=0, tzinfo=None)
     async with async_session_maker() as session:
@@ -61,7 +67,10 @@ async def send_reminders(bot: Bot) -> None:
                 .where(
                     User.reminders_enabled.is_(True),
                     User.reminder_time == current_time,
-                    or_(User.last_reminder_date.is_(None), User.last_reminder_date < today),
+                    or_(
+                        User.last_reminder_date.is_(None),
+                        User.last_reminder_date < today,
+                    ),
                 )
                 .distinct()
             )
@@ -87,8 +96,11 @@ async def send_reminders(bot: Bot) -> None:
             while True:
                 try:
                     await bot.send_rich_message(
-                        user_id, InputRichMessage(markdown=message),
-                        reply_markup=deadline_button(group_id, today, today + timedelta(days=1)),
+                        user_id,
+                        InputRichMessage(markdown=message),
+                        reply_markup=deadline_button(
+                            group_id, today, today + timedelta(days=1)
+                        ),
                         **topic_options,
                     )
                 except TelegramRetryAfter as exc:
@@ -105,7 +117,9 @@ async def send_reminders(bot: Bot) -> None:
         if not failed:
             async with async_session_maker() as session:
                 await session.execute(
-                    update(User).where(User.telegram_id == user_id).values(last_reminder_date=today)
+                    update(User)
+                    .where(User.telegram_id == user_id)
+                    .values(last_reminder_date=today)
                 )
                 await session.commit()
 
