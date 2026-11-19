@@ -146,10 +146,12 @@ async def change_group(ms: Message, state: FSMContext, session: AsyncSession):
     if ms.from_user is None:
         return
     name = (ms.text or "").strip()
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3}", name) is None:
+    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", name) is None:
         await ms.answer("Отправь номер группы в формате 261-329. Отмена: /cancel")
         return
-    user = await session.scalar(select(User).where(User.telegram_id == account_id(ms, ms.from_user.id)))
+    user = await session.scalar(
+        select(User).where(User.telegram_id == account_id(ms, ms.from_user.id))
+    )
     if user is None:
         await state.clear()
         await ms.answer("Сначала укажи свою учебную группу через /start.")

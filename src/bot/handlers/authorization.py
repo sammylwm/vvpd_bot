@@ -1,5 +1,5 @@
-from html import escape
 import re
+from html import escape
 
 from aiogram import Router
 from aiogram.filters import StateFilter
@@ -28,7 +28,7 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
         return
 
     group = ms.text or ""
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3}", group) is None:
+    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", group) is None:
         await ms.answer(
             "✏️ <b>Номер группы должен содержать 3 цифры, дефис и 3 цифры</b>\n\n"
             "Например: <code>261-329</code>\n",
@@ -46,7 +46,9 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
             select(User).where(User.telegram_id == account_id(ms, ms.from_user.id))
         )
         if user is None:
-            session.add(User(telegram_id=account_id(ms, ms.from_user.id), group=db_group))
+            session.add(
+                User(telegram_id=account_id(ms, ms.from_user.id), group=db_group)
+            )
         else:
             user.group = db_group
 
