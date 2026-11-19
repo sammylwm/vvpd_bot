@@ -55,7 +55,7 @@ def get_day_schedule(
     *,
     schedule_base_url: str = config.api.path,
 ) -> dict:
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3}", group) is None:
+    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", group) is None:
         raise ValueError("Invalid group")
     url = f"{schedule_base_url.rstrip('/')}/schedule/{group}/day"
     if day is not None:
