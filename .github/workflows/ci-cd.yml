@@ -1,0 +1,85 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          python-version: "3.13"
+      - name: Run tests
+        run: PYTHONPATH=src uv run --locked python -m unittest discover -s tests
+      - name: Build image
+        run: docker build .
+
+  deploy:
+    needs: ci
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    env:
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+    steps:
+      - name: Update bot on the server
+        shell: bash
+        run: |
+          : "${DEPLOY_HOST:?Set DEPLOY_HOST in repository variables}"
+          : "${DEPLOY_USER:?Set DEPLOY_USER in repository variables}"
+          : "${DEPLOY_PATH:?Set DEPLOY_PATH in repository variables}"
+          : "${DEPLOY_SSH_KEY:?Set DEPLOY_SSH_KEY in repository secrets}"
+          : "${DEPLOY_KNOWN_HOSTS:?Set DEPLOY_KNOWN_HOSTS in repository secrets}"
+
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf "$ssh_dir"' EXIT
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          encoded_path=$(printf '%s' "$DEPLOY_PATH" | base64 -w 0)
+
+          ssh -i "$ssh_dir/deploy_key" -p "$DEPLOY_PORT" -l "$DEPLOY_USER" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -- "$DEPLOY_HOST" bash -s -- "$GITHUB_SHA" "$encoded_path" <<'REMOTE'
+          set -euo pipefail
+          deploy_sha=$1
+          cd -- "$(printf '%s' "$2" | base64 -d)"
+
+          if [[ $(git branch --show-current) != main || -n $(git status --porcelain) ]]; then
+            echo 'Deploy checkout must be on main with a clean working tree.' >&2
+            exit 1
+          fi
+
+          git fetch origin refs/heads/main
+          if [[ $(git rev-parse FETCH_HEAD) != "$deploy_sha" ]]; then
+            echo 'Skipping deployment because main has moved.'
+            exit 0
+          fi
+
+          git merge --ff-only "$deploy_sha"
+          if [[ $(git rev-parse HEAD) != "$deploy_sha" ]]; then
+            echo 'Deploy checkout does not match the tested commit.' >&2
+            exit 1
+          fi
+
+          docker compose up -d --build --wait --wait-timeout 120 bot
+          REMOTE
