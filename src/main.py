@@ -25,7 +25,7 @@ async def main():
     dp = Dispatcher(disable_fsm=True, events_isolation=SimpleEventIsolation())
     dp.update.outer_middleware(AlbumMiddleware())
     dp.update.outer_middleware(dp.fsm)
-    await bot.send_message(chat_id=8364931329, text="Бот запущен")
+    await bot.send_message(chat_id=8364931329, text="Бот успешно запущен")
     dp.include_router(router)
     try:
         await preferences.initialize()
