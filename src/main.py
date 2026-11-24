@@ -1,41 +1,54 @@
 import asyncio
 import logging
-from contextlib import suppress
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums.parse_mode import ParseMode
+from aiogram.fsm.storage.memory import SimpleEventIsolation
+from aiohttp import ClientSession, ClientTimeout
 
-from bot.handlers import router
-from bot.reminders import run_reminders
+from bot.attachments import AlbumMiddleware
 from bot.group_topics import run_group_setup
-from core.db_helper import DbSessionMiddleware
+from bot.handlers import router
+from bot.preferences import preferences
+from bot.reminders import run_reminders
+from core.api import PolytechApi
 from settings.config import config
-
-bot = Bot(
-    config.bot.token.get_secret_value(),
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
-
-dp = Dispatcher()
-dp.include_router(router)
 
 
 async def main():
-    dp.update.middleware.register(DbSessionMiddleware())
-    logging.basicConfig(level=logging.DEBUG)
-    reminder_task = asyncio.create_task(run_reminders(bot))
-    group_setup_task = asyncio.create_task(run_group_setup(bot))
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(
+        config.bot.token.get_secret_value(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher(disable_fsm=True, events_isolation=SimpleEventIsolation())
+    dp.update.outer_middleware(AlbumMiddleware())
+    dp.update.outer_middleware(dp.fsm)
+    dp.include_router(router)
     try:
-        await dp.start_polling(bot, close_bot_session=False)
+        await preferences.initialize()
+        await poll(dp, bot)
     finally:
-        reminder_task.cancel()
-        group_setup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await reminder_task
-        with suppress(asyncio.CancelledError):
-            await group_setup_task
-        await bot.session.close()
+        await preferences.engine.dispose()
+
+
+async def poll(dp: Dispatcher, bot: Bot):
+    async with (
+        ClientSession(timeout=ClientTimeout(total=120)) as session,
+        bot.context(),
+    ):
+        api = PolytechApi(session, config.api.path)
+        tasks = (
+            asyncio.create_task(run_reminders(bot, api)),
+            asyncio.create_task(run_group_setup(bot)),
+        )
+        try:
+            await dp.start_polling(bot, api=api, close_bot_session=False)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

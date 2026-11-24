@@ -4,20 +4,12 @@ LABEL authors="sammy"
 
 WORKDIR /src
 
-ENV UV_NO_DEV=1
+RUN apk add --no-cache tzdata
 
 COPY pyproject.toml uv.lock ./
-
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
-COPY entrypoint.sh alembic.ini ./
-RUN chmod +x entrypoint.sh
-
-ENTRYPOINT ["sh", "./entrypoint.sh"]
-
-COPY alembic ./alembic
 COPY src ./src
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked
+CMD [".venv/bin/python", "src/main.py"]

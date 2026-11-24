@@ -10,26 +10,23 @@ from aiogram.types import (
     InputRichMessage,
     Message,
 )
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.attachments import send_deadline_attachments
+from bot.attachments import send_attachment_links
 from bot.identity import account_id
-from core.modules.deadline import Deadline
-from core.modules.group import Group
-from core.modules.user import User
+from bot.preferences import group_for_account
+from core.api import ApiError, PolytechApi
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
-def deadline_button(group_id: int, start: date, end: date) -> InlineKeyboardMarkup:
+def deadline_button(group: str, start: date, end: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="📝 Показать дедлайны",
-                    callback_data=f"schedule_tasks:{group_id}:{start.isoformat()}:{end.isoformat()}",
+                    callback_data=f"schedule_tasks:{group}:{start.isoformat()}:{end.isoformat()}",
                 ),
             ],
         ]
@@ -51,55 +48,35 @@ async def hide_deadlines(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("schedule_tasks:"))
-async def show_schedule_deadlines(callback: CallbackQuery, session: AsyncSession):
+async def show_schedule_deadlines(callback: CallbackQuery, api: PolytechApi):
     from .deadlines import render_deadlines
 
     if not isinstance(callback.message, Message):
         await callback.answer()
         return
     try:
-        _, group_id, first, last = callback.data.split(":")
+        _, requested_group, first, last = callback.data.split(":")
         start, end = date.fromisoformat(first), date.fromisoformat(last)
-        group_id = int(group_id)
         if start > end:
             raise ValueError("Invalid date range")
     except ValueError:
         await callback.answer("Некорректная кнопка.")
         return
-    try:
-        group = await session.scalar(
-            select(Group)
-            .join(User, User.group_id == Group.id)
-            .where(
-                User.telegram_id == account_id(callback.message, callback.from_user.id),
-                Group.id == group_id,
-            )
-        )
-        if group is None:
-            await callback.answer(
-                "Выбери расписание своей текущей группы.", show_alert=True
-            )
-            return
-        tasks = list(
-            await session.scalars(
-                select(Deadline)
-                .where(
-                    Deadline.group_id == group_id,
-                    Deadline.date >= start,
-                    Deadline.date <= end,
-                )
-                .order_by(Deadline.date, Deadline.subject, Deadline.id)
-            )
-        )
-    except Exception:
-        logger.exception("Failed to load schedule deadlines")
+    group = await group_for_account(account_id(callback.message, callback.from_user.id))
+    if group != requested_group:
         await callback.answer(
-            "Не удалось загрузить дедлайны. Попробуй позже.", show_alert=True
+            "Выбери расписание своей текущей группы.", show_alert=True
         )
         return
     await callback.answer()
+    try:
+        tasks = await api.deadlines(group, start, end)
+    except ApiError:
+        logger.exception("Failed to load schedule deadlines")
+        await callback.message.answer("Не удалось загрузить дедлайны. Попробуй позже.")
+        return
     text = (
-        render_deadlines(group.name, start, end, tasks)
+        render_deadlines(group, start, end, tasks)
         .replace("Дедлайны на неделю", "Дедлайны за выбранные даты")
         .replace("на эту неделю", "на эти даты")
     )
@@ -112,4 +89,4 @@ async def show_schedule_deadlines(callback: CallbackQuery, session: AsyncSession
             ]
         ),
     )
-    await send_deadline_attachments(ms.bot, ms.chat.id, tasks, ms.message_thread_id)
+    await send_attachment_links(ms, tasks)

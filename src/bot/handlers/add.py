@@ -1,36 +1,47 @@
-import asyncio
 import logging
-import unicodedata
-from dataclasses import dataclass
-from datetime import datetime
+from contextlib import ExitStack
 from html import escape
+from tempfile import TemporaryFile
 from uuid import uuid4
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from openai import APIError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiohttp import ClientError
 
-from ai.ai import SubjectClarificationRequired, get_json_homework, reconcile_homework
-from bot.attachments import AlbumMiddleware, message_attachments
+from bot.attachments import (
+    MAX_FILE_SIZE,
+    MAX_FILES,
+    attachment_from_message,
+    send_attachment_links,
+)
 from bot.identity import account_id
-from core.modules.deadline import Deadline
-from core.modules.group import Group
-from core.modules.user import User
+from bot.preferences import group_for_account
+from core.api import ApiError, DeadlinePreview, PolytechApi
 
 router = Router()
-router.message.middleware(AlbumMiddleware())
 logger = logging.getLogger(__name__)
 
 
 class AddDeadline(StatesGroup):
     waiting_for_text = State()
-    waiting_for_subject = State()
     waiting_for_confirmation = State()
+
+
+def deadline_details(preview: DeadlinePreview) -> str:
+    return (
+        f"Предмет: {escape(preview.subject)}\n"
+        f"Дата: {preview.date:%d.%m.%Y}\n"
+        f"Задание: {escape(preview.deadline)}"
+    )
 
 
 @router.message(Command("deadline"), StateFilter(None, AddDeadline))
@@ -39,7 +50,7 @@ async def command_deadline(ms: Message, state: FSMContext):
     await state.set_state(AddDeadline.waiting_for_text)
     await ms.answer(
         "Отправь текст дедлайна, например: сдать лабораторную по физике до пятницы."
-        "\nМожно прикрепить фото или файлы, в том числе альбомом. Текст укажи в подписи."
+        "\nМожно отправить до 5 фото или документов. Добавь текст в подпись или отправь его после файлов."
         "\nДля отмены: /cancel"
     )
 
@@ -50,259 +61,185 @@ async def cancel_deadline(ms: Message, state: FSMContext):
     await ms.answer("Добавление дедлайна отменено.")
 
 
-def normalize_deadline_text(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split()).rstrip(
-        ".!? "
-    )
-
-
-@dataclass(frozen=True)
-class SaveDeadlineResult:
-    status: str  # created, updated, unchanged
-    deadline: Deadline
-
-
-def merge_attachments(
-    existing: list[dict[str, str]], incoming: list[dict[str, str]]
-) -> list[dict[str, str]]:
-    merged = list(existing)
-    for attachment in incoming:
-        if any(
-            attachment["file_id"] == old["file_id"]
-            or (
-                attachment.get("file_unique_id")
-                and attachment.get("file_unique_id") == old.get("file_unique_id")
-            )
-            for old in merged
-        ):
-            continue
-        merged.append(attachment)
-    return merged
-
-
-async def save_deadline(
-    session: AsyncSession,
-    group: str,
-    homework: dict[str, str],
-    attachments: list[dict[str, str]] | None = None,
-) -> SaveDeadlineResult:
-    """Create or enrich one assignment while holding the group transaction lock."""
-    day = datetime.strptime(homework["date"], "%d-%m-%Y").date()
-    try:
-        # Serialize additions for this group so simultaneous requests cannot duplicate it.
-        db_group = await session.scalar(
-            select(Group).where(Group.name == group).with_for_update()
-        )
-        if db_group is None:
-            raise ValueError("Group no longer exists")
-        existing = await session.scalars(
-            select(Deadline).where(
-                Deadline.group_id == db_group.id,
-                Deadline.date == day,
-            )
-        )
-        subject = normalize_deadline_text(homework["subject"])
-        task = normalize_deadline_text(homework["homework"])
-        candidates = [
-            deadline
-            for deadline in existing
-            if normalize_deadline_text(deadline.subject) == subject
-        ]
-        matched = next(
-            (
-                deadline
-                for deadline in candidates
-                if normalize_deadline_text(deadline.deadline) == task
-            ),
-            None,
-        )
-        merged_text = matched.deadline if matched is not None else ""
-        if matched is None and candidates:
-            comparison = await asyncio.to_thread(
-                reconcile_homework,
-                homework["homework"],
-                [deadline.deadline for deadline in candidates],
-            )
-            if comparison.match_index is not None:
-                matched = candidates[comparison.match_index]
-                merged_text = comparison.merged_homework.strip()
-        if matched is not None:
-            files = merge_attachments(matched.attachments or [], attachments or [])
-            changed = normalize_deadline_text(merged_text) != normalize_deadline_text(
-                matched.deadline
-            ) or files != (matched.attachments or [])
-            if changed:
-                matched.deadline = merged_text
-                matched.attachments = files
-            await session.commit()
-            return SaveDeadlineResult("updated" if changed else "unchanged", matched)
-        deadline = Deadline(
-            group_id=db_group.id,
-            date=day,
-            subject=homework["subject"].strip(),
-            deadline=homework["homework"].strip(),
-            attachments=merge_attachments([], attachments or []),
-        )
-        session.add(deadline)
-        await session.commit()
-        return SaveDeadlineResult("created", deadline)
-    except Exception:
-        await session.rollback()
-        raise
-
-
-async def parse_deadline(
-    ms: Message, state: FSMContext, text: str, group: str, session: AsyncSession
+@router.message(AddDeadline.waiting_for_text, ~F.text.startswith("/"))
+async def receive_deadline(
+    ms: Message, state: FSMContext, api: PolytechApi, album: list[Message] | None = None
 ):
-    try:
-        homework = await asyncio.to_thread(get_json_homework, text, group)
-    except SubjectClarificationRequired as exc:
-        await state.set_state(AddDeadline.waiting_for_subject)
-        await ms.answer(str(exc))
+    if ms.from_user is None:
         return
-    except APIError:
-        logger.exception("AI service is unavailable")
-        await ms.answer(
-            "Сервис ИИ сейчас недоступен или не отвечает. Дедлайн не добавлен. "
-            "Повтори сообщение позже или используй /cancel для отмены."
-        )
+    group = await group_for_account(account_id(ms, ms.from_user.id))
+    if group is None:
+        await state.clear()
+        await ms.answer("Сначала укажи свою учебную группу через /start.")
         return
-    except Exception:
-        logger.exception("Failed to parse deadline")
-        await ms.answer(
-            "Не удалось обработать дедлайн. Попробуй ещё раз или используй /cancel."
-        )
-        return
-
-    if not homework["date"] or not homework["homework"].strip():
-        await state.set_state(AddDeadline.waiting_for_text)
-        await ms.answer(
-            "Не удалось определить дату или задание. Отправь полный текст дедлайна с датой ещё раз."
-        )
-        return
-    token = uuid4().hex
-    await state.update_data(homework=homework, confirmation_token=token)
-    await state.set_state(AddDeadline.waiting_for_confirmation)
-    await ms.answer(
-        f"Подтвердить добавление ДЗ?\n"
-        f"Предмет: {escape(homework['subject'])}\n"
-        f"Дата: {escape(homework['date'])}\n"
-        f"Задание: {escape(homework['homework'])}\n"
-        f"Вложений: {len((await state.get_data()).get('attachments', []))}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Подтвердить", callback_data=f"add_yes:{token}"),
-            InlineKeyboardButton(text="Отмена", callback_data=f"add_no:{token}"),
-        ]]),
-    )
-
-
-@router.callback_query(F.data.startswith("add_yes:") | F.data.startswith("add_no:"))
-async def confirm_deadline(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     data = await state.get_data()
-    if (await state.get_state() != AddDeadline.waiting_for_confirmation.state
-            or callback.data.split(":", 1)[1] != data.get("confirmation_token")):
+    if data.get("group") != group:
+        data = {}
+    attachments = {item["unique_id"]: item for item in data.get("attachments", [])}
+    messages = album or [ms]
+    for message in messages:
+        attachment = attachment_from_message(message)
+        if attachment is None:
+            if message.text:
+                continue
+            await ms.answer(
+                "Можно прикрепить фото или документ. Отправь поддерживаемый файл либо текст дедлайна."
+            )
+            return
+        if attachment["size"] > MAX_FILE_SIZE:
+            await ms.answer("Файл превышает 20 МиБ. Отправь файл меньшего размера.")
+            return
+        attachments[attachment["unique_id"]] = attachment
+    if len(attachments) > MAX_FILES:
+        await ms.answer("К одному дедлайну можно прикрепить до 5 файлов.")
+        return
+
+    files = list(attachments.values())
+    await state.update_data(
+        group=group,
+        attachments=files,
+        clarification_text=data.get("clarification_text"),
+    )
+    text = "\n".join(
+        part
+        for message in messages
+        if (part := (message.text or message.caption or "").strip())
+    )
+    if not text:
+        await ms.answer(
+            f"Выбрано файлов: {len(files)}. Отправь текст дедлайна или добавь ещё файлы."
+        )
+        return
+    if data.get("clarification_text"):
+        text = f"{data['clarification_text']}\nУточнение: {text}"
+    try:
+        preview = await api.parse(group, text)
+    except ApiError as exc:
+        if exc.status == 422:
+            await state.update_data(group=group, clarification_text=text)
+            detail = escape(exc.detail or "Уточни предмет, дату или задание.")
+            await ms.answer(f"{detail}\nОтправь уточнение или используй /cancel.")
+        else:
+            logger.warning("Failed to parse deadline, API status %s", exc.status)
+            await ms.answer(
+                "Не удалось обработать дедлайн. Повтори сообщение позже или используй /cancel."
+            )
+        return
+
+    token = uuid4().hex
+    await ms.answer(
+        f"Подтвердить добавление ДЗ?\n{deadline_details(preview)}\nФайлов: {len(files)}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Подтвердить", callback_data=f"add_yes:{token}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Отмена", callback_data=f"add_no:{token}"
+                    ),
+                ]
+            ]
+        ),
+    )
+    await state.update_data(
+        preview=preview.model_dump(mode="json"), confirmation_token=token
+    )
+    await state.set_state(AddDeadline.waiting_for_confirmation)
+
+
+@router.callback_query(
+    F.data.startswith("add_yes:")
+    | F.data.startswith("add_no:")
+    | F.data.startswith("add_text:")
+)
+async def confirm_deadline(
+    callback: CallbackQuery, state: FSMContext, api: PolytechApi
+):
+    ms = callback.message
+    data = await state.get_data()
+    if (
+        not isinstance(ms, Message)
+        or await state.get_state() != AddDeadline.waiting_for_confirmation.state
+        or callback.data.split(":", 1)[1] != data.get("confirmation_token")
+    ):
         await callback.answer("Это подтверждение уже неактуально.")
         return
     await callback.answer()
-    ms = callback.message
-    if not isinstance(ms, Message):
-        return
     if callback.data.startswith("add_no:"):
         await state.clear()
         await ms.edit_reply_markup(reply_markup=None)
         await ms.answer("Добавление дедлайна отменено.")
         return
-    # Resolve membership again: the group may have changed since the preview.
-    group = await session.scalar(
-        select(Group.name).join(User, User.group_id == Group.id)
-        .where(User.telegram_id == account_id(callback.message, callback.from_user.id))
-    )
-    if group != data.get("group"):
+    preview = DeadlinePreview.model_validate(data["preview"])
+    if preview.group != await group_for_account(account_id(ms, callback.from_user.id)):
         await state.clear()
         await ms.answer("Группа изменилась. Начни добавление заново: /deadline.")
         return
+    attachments = (
+        [] if callback.data.startswith("add_text:") else data.get("attachments", [])
+    )
     try:
-        result = await save_deadline(
-            session, group, data["homework"], data.get("attachments", [])
-        )
-    except APIError:
-        logger.exception("AI duplicate check is unavailable")
+        if attachments:
+            with ExitStack() as stack:
+                uploads = []
+                for attachment in attachments:
+                    stream = stack.enter_context(TemporaryFile())
+                    await ms.bot.download(attachment["file_id"], destination=stream)
+                    uploads.append(
+                        (attachment["name"], attachment["content_type"], stream)
+                    )
+                result = await api.confirm(preview, uploads)
+        else:
+            result = await api.confirm(preview)
+    except (TelegramAPIError, ClientError, OSError, TimeoutError):
+        logger.exception("Failed to download Telegram attachments")
         await ms.answer(
-            "Сервис ИИ сейчас недоступен. Не удалось проверить дубликаты, "
-            "поэтому дедлайн не добавлен. Повтори сообщение позже или используй /cancel."
+            "Не удалось скачать файлы из Telegram. Повтори подтверждение позже."
         )
         return
-    except Exception:
-        logger.exception("Failed to save deadline")
+    except ApiError as exc:
+        if attachments and exc.status in {409, 413, 422}:
+            detail = escape(exc.detail or "API отклонил вложения.")
+            token = data["confirmation_token"]
+            await ms.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Сохранить без файлов",
+                                callback_data=f"add_text:{token}",
+                            ),
+                            InlineKeyboardButton(
+                                text="Отмена", callback_data=f"add_no:{token}"
+                            ),
+                        ]
+                    ]
+                )
+            )
+            await ms.answer(
+                f"{detail}\nМожно сохранить только текст или начать заново через /deadline."
+            )
+            return
+        logger.warning("Failed to confirm deadline, API status %s", exc.status)
         await ms.answer(
-            "Не удалось сохранить дедлайн. Попробуй ещё раз или используй /cancel."
+            "Не удалось сохранить дедлайн. Нажми «Подтвердить» позже или используй /cancel."
         )
         return
 
     await state.clear()
     await ms.edit_reply_markup(reply_markup=None)
-    if result.status == "unchanged":
-        await ms.answer("Такой дедлайн уже есть у твоей группы. Повторно не добавляю.")
-        return
-    title = "Дедлайн обновлён." if result.status == "updated" else "Дедлайн добавлен."
-    deadline = result.deadline
-    await ms.answer(
-        f"{title}\n"
-        f"Предмет: {escape(deadline.subject)}\n"
-        f"Дата: {deadline.date:%d-%m-%Y}\n"
-        f"Задание: {escape(deadline.deadline)}\n"
-        f"Вложений: {len(deadline.attachments or [])}",
-        parse_mode="HTML",
-    )
-
-
-@router.message(AddDeadline.waiting_for_text, ~F.text.startswith("/"))
-async def receive_deadline(
-    ms: Message, state: FSMContext, session: AsyncSession, album: list[Message]
-):
-    text = "\n".join(message.text or message.caption or "" for message in album).strip()
-    attachments = [item for message in album for item in message_attachments(message)]
-    if attachments:
-        data = await state.get_data()
-        attachments = data.get("attachments", []) + attachments
-        await state.update_data(attachments=attachments)
-    if not text:
-        await ms.answer(
-            "Отправь текст дедлайна с датой. Прикреплённые файлы сохранены."
-            if attachments
-            else "Отправь непустой текст дедлайна."
-        )
-        return
-    if ms.from_user is None:
-        return
-    group = await session.scalar(
-        select(Group.name)
-        .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == account_id(ms, ms.from_user.id))
-    )
-    if group is None:
-        await ms.answer("Сначала укажи свою учебную группу.")
-        return
-
-    if not attachments:
-        data = await state.get_data()
-        attachments = data.get("attachments", [])
-    await state.update_data(deadline_text=text, group=group, attachments=attachments)
-    await parse_deadline(ms, state, text, group, session)
-
-
-@router.message(AddDeadline.waiting_for_subject, F.text, ~F.text.startswith("/"))
-async def receive_subject(ms: Message, state: FSMContext, session: AsyncSession):
-    subject = (ms.text or "").strip()
-    if not subject:
-        await ms.answer("Напиши название предмета.")
-        return
-    data = await state.get_data()
-    text = f"{data['deadline_text']}\nУточнение предмета: {subject}"
-    await parse_deadline(ms, state, text, data["group"], session)
+    title = {
+        "created": "Дедлайн добавлен.",
+        "updated": "Дедлайн обновлён.",
+        "unchanged": "Такой дедлайн уже есть у твоей группы.",
+    }[result.status]
+    await ms.answer(f"{title}\n{deadline_details(result.deadline)}")
+    await send_attachment_links(ms, [result.deadline])
 
 
 @router.message(StateFilter(AddDeadline))
 async def deadline_text_required(ms: Message):
-    await ms.answer("Отправь ответ текстом или используй /cancel для отмены.")
+    await ms.answer(
+        "Отправь текст дедлайна, нажми кнопку подтверждения или используй /cancel."
+    )

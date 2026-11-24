@@ -2,7 +2,20 @@ from aiogram import Router
 
 from bot.group_topics import DeadlineTopicMiddleware
 
-from . import add, authorization, common, day, deadline_buttons, deadlines, delete, group_setup, profile, semester, session_tasks, week
+from . import (
+    add,
+    authorization,
+    common,
+    day,
+    deadline_buttons,
+    deadlines,
+    delete,
+    group_setup,
+    profile,
+    semester,
+    session_tasks,
+    week,
+)
 
 router = Router()
 work_router = Router()

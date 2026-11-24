@@ -1,4 +1,5 @@
 import re
+from dataclasses import replace
 from datetime import time
 
 from aiogram import F, Router
@@ -14,12 +15,10 @@ from aiogram.types import (
     Message,
     RichMessageButton,
 )
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.identity import account_id
-from core.modules.group import Group
-from core.modules.user import User
+from bot.preferences import ProfileSettings, preferences
+from core.group_number import is_valid_group_number
 
 router = Router()
 
@@ -29,12 +28,12 @@ class Profile(StatesGroup):
     waiting_for_time = State()
 
 
-def render_profile(user: User, group: Group) -> InputRichMessage:
+def render_profile(user: ProfileSettings) -> InputRichMessage:
     enabled = user.reminders_enabled
     return InputRichMessage(
         blocks=[
             InputRichBlockSectionHeading(text="👤 Твой профиль", size=1),
-            InputRichBlockParagraph(text=f"🎓 Группа: {group.name}"),
+            InputRichBlockParagraph(text=f"🎓 Группа: {user.group}"),
             InputRichBlockParagraph(
                 text=(
                     f"⏰ Уведомления включены: ежедневно в {user.reminder_time:%H:%M} по Москве."
@@ -66,28 +65,19 @@ def render_profile(user: User, group: Group) -> InputRichMessage:
     )
 
 
-async def load_profile(session: AsyncSession, telegram_id: int):
-    result = await session.execute(
-        select(User, Group)
-        .join(Group, User.group_id == Group.id)
-        .where(User.telegram_id == telegram_id)
-    )
-    return result.first()
-
-
 @router.message(Command("profile"), StateFilter(None))
-async def command_profile(ms: Message, session: AsyncSession):
+async def command_profile(ms: Message):
     if ms.from_user is None:
         return
-    profile = await load_profile(session, account_id(ms, ms.from_user.id))
+    profile = await preferences.profile(account_id(ms, ms.from_user.id))
     if profile is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
-    await ms.answer_rich(render_profile(*profile))
+    await ms.answer_rich(render_profile(profile))
 
 
 @router.callback_query(F.data.startswith("profile:"))
-async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSession):
+async def profile_action(cb: CallbackQuery, state: FSMContext):
     _, action, owner = (cb.data or "").split(":", 2)
     if owner != str(account_id(cb.message, cb.from_user.id)):
         await cb.answer(
@@ -103,7 +93,7 @@ async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSes
             "Сначала заверши текущий ввод или отправь /cancel.", show_alert=True
         )
         return
-    profile = await load_profile(session, account_id(cb.message, cb.from_user.id))
+    profile = await preferences.profile(account_id(cb.message, cb.from_user.id))
     if profile is None:
         await cb.answer("Сначала укажи свою учебную группу.", show_alert=True)
         return
@@ -114,7 +104,7 @@ async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSes
             InputRichMessage(
                 markdown=(
                     "# ✏️ Изменить группу\n\n"
-                    "Отправь номер новой группы в формате **261-329**.\n\n"
+                    "Отправь номер новой группы, например **261-329**.\n\n"
                     "Отмена: /cancel"
                 )
             )
@@ -126,11 +116,12 @@ async def profile_action(cb: CallbackQuery, state: FSMContext, session: AsyncSes
             "Отправь время уведомления в формате hh:mm, например 09:30. Часовой пояс: Москва. Отмена: /cancel"
         )
     elif action in ("on", "off"):
-        user, group = profile
-        user.reminders_enabled = action == "on"
-        await session.commit()
+        await preferences.update_profile(
+            profile.telegram_id, reminders_enabled=action == "on"
+        )
+        profile = replace(profile, reminders_enabled=action == "on")
         await cb.answer("Настройка сохранена")
-        await cb.message.answer_rich(render_profile(user, group))
+        await cb.message.answer_rich(render_profile(profile))
     else:
         await cb.answer()
 
@@ -142,29 +133,22 @@ async def cancel_group_change(ms: Message, state: FSMContext):
 
 
 @router.message(Profile.waiting_for_group)
-async def change_group(ms: Message, state: FSMContext, session: AsyncSession):
+async def change_group(ms: Message, state: FSMContext):
     if ms.from_user is None:
         return
     name = (ms.text or "").strip()
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", name) is None:
-        await ms.answer("Отправь номер группы в формате 261-329. Отмена: /cancel")
+    if not is_valid_group_number(name):
+        await ms.answer("Отправь номер группы, например 261-329. Отмена: /cancel")
         return
-    user = await session.scalar(
-        select(User).where(User.telegram_id == account_id(ms, ms.from_user.id))
-    )
-    if user is None:
+    profile = await preferences.profile(account_id(ms, ms.from_user.id))
+    if profile is None:
         await state.clear()
         await ms.answer("Сначала укажи свою учебную группу через /start.")
         return
-    group = await session.scalar(select(Group).where(Group.name == name))
-    if group is None:
-        group = Group(name=name)
-        session.add(group)
-        await session.flush()
-    user.group_id = group.id
-    await session.commit()
+    await preferences.set_group(profile.telegram_id, name)
+    profile = replace(profile, group=name)
     await state.clear()
-    await ms.answer_rich(render_profile(user, group))
+    await ms.answer_rich(render_profile(profile))
 
 
 @router.message(Profile.waiting_for_time, Command("cancel"))
@@ -174,7 +158,7 @@ async def cancel_time_change(ms: Message, state: FSMContext):
 
 
 @router.message(Profile.waiting_for_time)
-async def change_time(ms: Message, state: FSMContext, session: AsyncSession):
+async def change_time(ms: Message, state: FSMContext):
     if ms.from_user is None:
         return
     value = (ms.text or "").strip()
@@ -183,13 +167,13 @@ async def change_time(ms: Message, state: FSMContext, session: AsyncSession):
             "Введи время в формате hh:mm от 00:00 до 23:59, например 09:30. Отмена: /cancel"
         )
         return
-    profile = await load_profile(session, account_id(ms, ms.from_user.id))
+    profile = await preferences.profile(account_id(ms, ms.from_user.id))
     if profile is None:
         await state.clear()
         await ms.answer("Сначала укажи свою учебную группу через /start.")
         return
-    user, group = profile
-    user.reminder_time = time.fromisoformat(value)
-    await session.commit()
+    reminder_time = time.fromisoformat(value)
+    await preferences.update_profile(profile.telegram_id, reminder_time=reminder_time)
+    profile = replace(profile, reminder_time=reminder_time)
     await state.clear()
-    await ms.answer_rich(render_profile(user, group))
+    await ms.answer_rich(render_profile(profile))

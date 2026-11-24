@@ -1,73 +1,31 @@
-import asyncio
-import json
 import logging
 import re
-import unicodedata
 from datetime import date, datetime, timedelta
-from urllib.parse import urlencode
-from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 from aiogram import Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.types import InputRichMessage, Message
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.handlers.deadline_buttons import deadline_button
 from bot.identity import account_id
-from core.modules.deadline import Deadline
-from core.modules.group import Group
-from core.modules.user import User
-from settings.config import config
+from bot.preferences import group_for_account
+from core.api import ApiError, PolytechApi
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
 @router.message(Command("reminder"), StateFilter(None))
-async def command_reminder(ms: Message, session: AsyncSession):
-    # Import here because the reminder service reuses this module's day renderer.
-    from bot.reminders import build_reminder_payload
-
+async def command_reminder(ms: Message, api: PolytechApi):
     if ms.from_user is None:
         return
-    group = await session.scalar(
-        select(Group)
-        .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == account_id(ms, ms.from_user.id))
-    )
+    group = await group_for_account(account_id(ms, ms.from_user.id))
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
     today = datetime.now(ZoneInfo("Europe/Moscow")).date()
-    messages, _ = await build_reminder_payload(
-        group.id, group.name, today
-    )
-    for message in messages:
-        await ms.answer_rich(InputRichMessage(markdown=message),
-                             reply_markup=deadline_button(group.id, today, today + timedelta(days=1)))
-
-
-def get_day_schedule(
-    group: str,
-    day: date | None = None,
-    *,
-    schedule_base_url: str = config.api.path,
-) -> dict:
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", group) is None:
-        raise ValueError("Invalid group")
-    url = f"{schedule_base_url.rstrip('/')}/schedule/{group}/day"
-    if day is not None:
-        url += "?" + urlencode({"day": day.isoformat()})
-    with urlopen(url, timeout=60) as response:
-        result = json.load(response)
-    response_day = date.fromisoformat(result["date"])
-    if day is not None and response_day != day:
-        raise ValueError("Schedule returned a different date")
-    if not isinstance(result["lessons"], list):
-        raise ValueError("Invalid schedule response")
-    return result
+    await send_schedule(ms, api, group, today, today + timedelta(days=1))
 
 
 def markdown_text(value: str) -> str:
@@ -75,12 +33,7 @@ def markdown_text(value: str) -> str:
     return re.sub(r"([\\`*_{}\[\]<>()#+.!|~>\-])", r"\\\1", value)
 
 
-def subject_key(value: str) -> str:
-    value = re.sub(r"\([^()]*\)", "", value)
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-
-def render_day(group: str, schedule: dict, deadlines: list[Deadline]) -> str:
+def render_day(group: str, schedule: dict) -> str:
     day = date.fromisoformat(schedule["date"])
     weekdays = (
         "понедельник",
@@ -110,7 +63,7 @@ def render_day(group: str, schedule: dict, deadlines: list[Deadline]) -> str:
             parts.extend(
                 [
                     f"### {lesson['pair']} пара",
-                    f"🕒 **{markdown_text(lesson['start'])}–{markdown_text(lesson['end'])}**",
+                    f"🕒 **{markdown_text(lesson['start'])}-{markdown_text(lesson['end'])}**",
                     f"**{markdown_text(lesson['subject'])}**",
                 ]
             )
@@ -129,17 +82,17 @@ def render_day(group: str, schedule: dict, deadlines: list[Deadline]) -> str:
 
 
 @router.message(Command("day", "nextday"), StateFilter(None))
-async def command_day(ms: Message, command: CommandObject, session: AsyncSession):
+async def command_day(ms: Message, command: CommandObject, api: PolytechApi):
     if ms.from_user is None:
         return
-    day = None
+    day = datetime.now(ZoneInfo("Europe/Moscow")).date()
     if command.command == "nextday":
         if command.args:
             await ms.answer(
-                "Используй /nextday без даты — покажу расписание на завтра."
+                "Используй /nextday без даты - покажу расписание на завтра."
             )
             return
-        day = datetime.now(ZoneInfo("Europe/Moscow")).date() + timedelta(days=1)
+        day += timedelta(days=1)
     elif command.args:
         try:
             if (
@@ -153,25 +106,27 @@ async def command_day(ms: Message, command: CommandObject, session: AsyncSession
                 "Укажи дату в формате /day ГГГГ-ММ-ДД, например /day 2026-11-03."
             )
             return
-    group = await session.scalar(
-        select(Group)
-        .join(User, User.group_id == Group.id)
-        .where(User.telegram_id == account_id(ms, ms.from_user.id))
-    )
+    group = await group_for_account(account_id(ms, ms.from_user.id))
     if group is None:
         await ms.answer("Сначала укажи свою учебную группу.")
         return
+    await send_schedule(ms, api, group, day, day)
+
+
+async def send_schedule(
+    ms: Message, api: PolytechApi, group: str, day: date, deadline_end: date
+):
     try:
-        schedule = await asyncio.to_thread(get_day_schedule, group.name, day)
-        # Use the API's date, including when it selected today itself.
-        schedule_day = date.fromisoformat(schedule["date"])
-    except Exception:
+        schedule = await api.schedule(group, day, day)
+    except ApiError:
         logger.exception("Failed to fetch daily schedule")
-        await ms.answer(
-            "Не удалось получить расписание: сервис недоступен или вернул ошибку. Попробуй позже."
-        )
+        await ms.answer("Не удалось получить расписание. Попробуй позже.")
         return
     await ms.answer_rich(
-        InputRichMessage(markdown=render_day(group.name, schedule, [])),
-        reply_markup=deadline_button(group.id, schedule_day, schedule_day),
+        InputRichMessage(
+            markdown=render_day(
+                group, {"date": day.isoformat(), "lessons": schedule.lessons}
+            )
+        ),
+        reply_markup=deadline_button(group, day, deadline_end),
     )

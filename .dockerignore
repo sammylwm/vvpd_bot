@@ -1,0 +1,7 @@
+**
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+src/settings/.env
+**/__pycache__/

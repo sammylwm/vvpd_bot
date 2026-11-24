@@ -1,104 +1,83 @@
-"""Telegram media collection and delivery without downloading files."""
-
 import asyncio
-import logging
 from html import escape
+from urllib.parse import urlsplit
 
-from aiogram import BaseMiddleware, Bot
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.types import Message
+from aiogram import BaseMiddleware
+from aiogram.types import LinkPreviewOptions, Message, Update
 
-from core.modules.deadline import Deadline
+from core.api import Deadline
 
-logger = logging.getLogger(__name__)
-MEDIA_TYPES = (
-    "photo",
-    "document",
-    "video",
-    "audio",
-    "voice",
-    "animation",
-    "video_note",
-    "sticker",
-)
-
-
-def message_attachments(message: Message) -> list[dict[str, str]]:
-    for kind in MEDIA_TYPES:
-        media = getattr(message, kind)
-        if media:
-            if kind == "photo":
-                media = media[-1]
-            return [
-                {
-                    "type": kind,
-                    "file_id": media.file_id,
-                    "file_unique_id": media.file_unique_id,
-                }
-            ]
-    return []
+MAX_FILES = 5
+MAX_FILE_SIZE = 20 * 1024 * 1024
 
 
 class AlbumMiddleware(BaseMiddleware):
-    """Collect the separate updates Telegram sends for a single album."""
-
     def __init__(self):
         self.albums: dict[tuple[int, str], list[Message]] = {}
+        self.pending: dict[tuple[int, int | None], asyncio.Future[None]] = {}
 
-    async def __call__(self, handler, event: Message, data):
-        if not event.media_group_id:
-            data["album"] = [event]
+    async def __call__(self, handler, event: Update, data):
+        message = event.message
+        if message is None:
             return await handler(event, data)
-        key = (event.chat.id, event.media_group_id)
+        sender = (message.chat.id, message.from_user.id if message.from_user else None)
+        previous = self.pending.get(sender)
+        if not message.media_group_id:
+            if previous is not None:
+                await asyncio.shield(previous)
+            return await handler(event, data)
+        key = (message.chat.id, message.media_group_id)
         if key in self.albums:
-            self.albums[key].append(event)
+            self.albums[key].append(message)
             return
-        messages = self.albums[key] = [event]
+        messages = self.albums[key] = [message]
+        completed = self.pending[sender] = asyncio.get_running_loop().create_future()
         try:
             await asyncio.sleep(1)
-        finally:
             self.albums.pop(key, None)
-        data["album"] = sorted(messages, key=lambda message: message.message_id)
-        return await handler(event, data)
+            if previous is not None:
+                await asyncio.shield(previous)
+            data["album"] = sorted(messages, key=lambda item: item.message_id)
+            return await handler(event, data)
+        finally:
+            if self.albums.get(key) is messages:
+                self.albums.pop(key)
+            if self.pending.get(sender) is completed:
+                self.pending.pop(sender)
+            completed.set_result(None)
 
 
-async def send_deadline_attachments(
-    bot: Bot,
-    chat_id: int,
-    deadlines: list[Deadline],
-    message_thread_id: int | None = None,
-) -> None:
-    for task in deadlines:
-        attachments = task.attachments or []
-        if not attachments:
-            continue
-        # Keep the full task in a separate message: Telegram captions have a smaller limit.
-        await bot.send_message(
-            chat_id,
-            f"📎 {escape(task.subject)} · {task.date:%d.%m.%Y}\n"
-            f"{escape(task.deadline)}",
-            parse_mode="HTML",
-            message_thread_id=message_thread_id,
-        )
-        for attachment in attachments:
-            kind = attachment["type"]
-            while True:
-                try:
-                    await getattr(bot, f"send_{kind}")(
-                        chat_id=chat_id,
-                        **{kind: attachment["file_id"]},
-                        message_thread_id=message_thread_id,
-                    )
-                    break
-                except TelegramRetryAfter as exc:
-                    await asyncio.sleep(exc.retry_after)
-                except TelegramAPIError:
-                    logger.exception(
-                        "Failed to send attachment for deadline %s", task.id
-                    )
-                    await bot.send_message(
-                        chat_id,
-                        "Не удалось отправить вложение. Попробуй позже.",
-                        message_thread_id=message_thread_id,
-                    )
-                    break
+def attachment_from_message(message: Message) -> dict | None:
+    media = message.document or (message.photo[-1] if message.photo else None)
+    if media is None:
+        return None
+    if message.document:
+        name = message.document.file_name or "document"
+        content_type = message.document.mime_type or "application/octet-stream"
+    else:
+        name = f"photo-{message.message_id}.jpg"
+        content_type = "image/jpeg"
+    return {
+        "file_id": media.file_id,
+        "unique_id": media.file_unique_id,
+        "name": name,
+        "content_type": content_type,
+        "size": media.file_size or 0,
+    }
+
+
+async def send_attachment_links(message: Message, deadlines: list[Deadline]) -> None:
+    for deadline in deadlines:
+        links = []
+        for attachment in deadline.attachments:
+            url = urlsplit(attachment.url)
+            if url.scheme in {"http", "https"} and url.netloc:
+                links.append(
+                    f'<a href="{escape(attachment.url)}">{escape(attachment.name)}</a>'
+                )
+        if links:
+            await message.answer(
+                f"📎 {escape(deadline.subject)} · {deadline.date:%d.%m.%Y}\n"
+                + "\n".join(links),
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )

@@ -1,133 +1,76 @@
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.types import InputRichMessage
-from sqlalchemy import or_, select, update
 
-from bot.handlers.day import get_day_schedule, markdown_text, render_day
+from bot.handlers.day import render_day
 from bot.handlers.deadline_buttons import deadline_button
-from core.db_helper import async_session_maker
-from core.modules.deadline import Deadline
-from core.modules.group import Group
-from core.modules.telegram_chat import TelegramChat
-from core.modules.user import User
+from bot.preferences import preferences
+from core.api import ApiError, PolytechApi
 
 logger = logging.getLogger(__name__)
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
-def render_tomorrow_deadlines(day: date, deadlines: list[Deadline]) -> str:
-    parts = [f"# ⏰ Дедлайны на завтра · {day:%d.%m.%Y}"]
-    if deadlines:
-        for task in deadlines:
-            parts.append(
-                f"- **{markdown_text(task.subject)}** — {markdown_text(task.deadline)}"
-            )
-    else:
-        parts.append("> ✅ Заданий на завтра пока нет.")
-    return "\n\n".join(parts)
-
-
-async def build_reminder_payload(
-    group_id: int, group_name: str, today: date
-) -> tuple[list[str], list[Deadline]]:
-    try:
-        schedule = await asyncio.to_thread(get_day_schedule, group_name, today)
-        message = render_day(group_name, schedule, [])
-    except Exception:
-        logger.exception("Failed to fetch schedule for group %s", group_name)
-        message = (
-            "Не удалось получить расписание на сегодня. Попробуй позже через /day."
-        )
-    return [message], []
-
-
-async def build_reminder_messages(
-    group_id: int, group_name: str, today: date
-) -> list[str]:
-    messages, _ = await build_reminder_payload(group_id, group_name, today)
-    return messages
-
-
-async def send_reminders(bot: Bot) -> None:
+async def send_reminders(bot: Bot, api: PolytechApi) -> None:
     now = datetime.now(MOSCOW)
     if now.weekday() == 6:
         return
     today = now.date()
     current_time = now.time().replace(second=0, microsecond=0, tzinfo=None)
-    async with async_session_maker() as session:
-        users = list(
-            await session.execute(
-                select(User.telegram_id, Group.id, Group.name)
-                .join(Group, User.group_id == Group.id)
-                .where(
-                    User.reminders_enabled.is_(True),
-                    User.reminder_time == current_time,
-                    or_(
-                        User.last_reminder_date.is_(None),
-                        User.last_reminder_date < today,
-                    ),
-                )
-                .distinct()
-            )
-        )
-
-    messages_by_group: dict[int, tuple[list[str], list[Deadline]]] = {}
-    for user_id, group_id, group_name in users:
+    messages_by_group: dict[str, str | None] = {}
+    for profile in await preferences.due_profiles(today, current_time):
+        chat_id, group = profile.telegram_id, profile.group
         topic_options = {}
-        if user_id < 0:
-            async with async_session_maker() as session:
-                chat = await session.get(TelegramChat, user_id)
-                if chat is None or not chat.active or chat.topic_id is None:
-                    continue
-                topic_options["message_thread_id"] = chat.topic_id
-        if group_id not in messages_by_group:
-            messages_by_group[group_id] = await build_reminder_payload(
-                group_id, group_name, today
-            )
+        if chat_id < 0:
+            chat = await preferences.topic(chat_id)
+            if chat is None or not chat.active or chat.topic_id is None:
+                continue
+            topic_options["message_thread_id"] = chat.topic_id
 
-        messages, _ = messages_by_group[group_id]
-        failed = False
-        for message in messages:
-            while True:
-                try:
-                    await bot.send_rich_message(
-                        user_id,
-                        InputRichMessage(markdown=message),
-                        reply_markup=deadline_button(
-                            group_id, today, today + timedelta(days=1)
-                        ),
-                        **topic_options,
-                    )
-                except TelegramRetryAfter as exc:
-                    await asyncio.sleep(exc.retry_after)
-                    continue
-                except TelegramAPIError:
-                    logger.exception("Failed to send reminder to user %s", user_id)
-                    failed = True
-                break
-            await asyncio.sleep(0.05)
-            if failed:
-                break
-
-        if not failed:
-            async with async_session_maker() as session:
-                await session.execute(
-                    update(User)
-                    .where(User.telegram_id == user_id)
-                    .values(last_reminder_date=today)
+        if group not in messages_by_group:
+            try:
+                schedule = await api.schedule(group, today, today)
+                messages_by_group[group] = render_day(
+                    group,
+                    {"date": today.isoformat(), "lessons": schedule.lessons},
                 )
-                await session.commit()
+            except ApiError:
+                logger.exception("Failed to fetch schedule for group %s", group)
+                messages_by_group[group] = None
+        message = messages_by_group[group]
+        if message is None:
+            continue
+
+        while True:
+            try:
+                await bot.send_rich_message(
+                    chat_id,
+                    InputRichMessage(markdown=message),
+                    reply_markup=deadline_button(
+                        group, today, today + timedelta(days=1)
+                    ),
+                    **topic_options,
+                )
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+                continue
+            except TelegramAPIError:
+                logger.exception("Failed to send reminder to chat %s", chat_id)
+            else:
+                await preferences.update_profile(chat_id, last_reminder_date=today)
+            break
+        await asyncio.sleep(0.05)
 
 
-async def run_reminders(bot: Bot) -> None:
+async def run_reminders(bot: Bot, api: PolytechApi) -> None:
     while True:
         try:
-            await send_reminders(bot)
+            await send_reminders(bot, api)
         except Exception:
             logger.exception("Reminder broadcast failed")
         now = datetime.now(MOSCOW)

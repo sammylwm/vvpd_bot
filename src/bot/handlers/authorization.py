@@ -1,4 +1,3 @@
-import re
 from html import escape
 
 from aiogram import Router
@@ -6,12 +5,10 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InputRichMessage, Message
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.identity import account_id
-from core.modules.group import Group
-from core.modules.user import User
+from bot.preferences import preferences
+from core.group_number import is_valid_group_number
 
 from .filters import UnregisteredUser
 
@@ -23,12 +20,12 @@ class Authorization(StatesGroup):
 
 
 @router.message(Authorization.waiting_for_group)
-async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
+async def receive_group(ms: Message, state: FSMContext):
     if ms.from_user is None:
         return
 
-    group = ms.text or ""
-    if re.fullmatch(r"[0-9]{3}-[0-9]{3,}", group) is None:
+    group = (ms.text or "").strip()
+    if not is_valid_group_number(group):
         await ms.answer(
             "✏️ <b>Номер группы должен содержать 3 цифры, дефис и 3 цифры</b>\n\n"
             "Например: <code>261-329</code>\n",
@@ -36,21 +33,8 @@ async def receive_group(ms: Message, state: FSMContext, session: AsyncSession):
         )
         return
 
-    async with session.begin():
-        db_group = await session.scalar(select(Group).where(Group.name == group))
-        if db_group is None:
-            db_group = Group(name=group)
-            session.add(db_group)
-
-        user = await session.scalar(
-            select(User).where(User.telegram_id == account_id(ms, ms.from_user.id))
-        )
-        if user is None:
-            session.add(
-                User(telegram_id=account_id(ms, ms.from_user.id), group=db_group)
-            )
-        else:
-            user.group = db_group
+    owner = account_id(ms, ms.from_user.id)
+    await preferences.set_group(owner, group)
 
     await state.clear()
     await ms.answer(

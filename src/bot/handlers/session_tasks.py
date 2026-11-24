@@ -1,8 +1,6 @@
-import asyncio
 import logging
 import re
 from datetime import date, datetime
-from html import escape
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -11,32 +9,33 @@ from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputRichBlockButtons, InputRichBlockDetails, InputRichBlockDivider,
-    InputRichBlockParagraph, InputRichBlockSectionHeading, InputRichMessage,
-    Message, RichMessageButton, RichTextBold,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichBlockDetails,
+    InputRichBlockParagraph,
+    InputRichBlockSectionHeading,
+    InputRichMessage,
+    Message,
 )
-from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai.ai import SubjectClarificationRequired, reconcile_homework
-from ai.session_tasks import ParsedSessionTasks, parse_session_tasks
-from bot.handlers.add import normalize_deadline_text
-from bot.handlers.day import subject_key
-from bot.handlers.semester import get_semester_schedule
 from bot.identity import account_id
-from core.modules.group import Group
-from core.modules.session_task import SessionTask
-from core.modules.user import User
+from bot.preferences import group_for_account
+from core.api import (
+    ApiError,
+    PolytechApi,
+    SessionSubject,
+    SessionTaskDraft,
+    SessionTaskText,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
 class AddSessionTask(StatesGroup):
-    subject = State()
-    text = State()
-    confirmation = State()
+    waiting_for_text = State()
+    waiting_for_confirmation = State()
 
 
 def current_semester(day: date | None = None) -> str:
@@ -46,292 +45,255 @@ def current_semester(day: date | None = None) -> str:
     return f"{day.year}-{'1' if day.month < 9 else '2'}"
 
 
-def semester_title(key: str) -> str:
-    year, half = key.split("-")
-    return f"Весна {year}" if half == "1" else f"Осень {year} / зима {int(year) + 1}"
+def task_details(task: SessionTaskDraft) -> str:
+    due = f"Срок: {task.due_date:%d.%m.%Y}" if task.due_date else "Без срока"
+    return f"{task.text}\n{due}"
 
 
-async def user_group(session: AsyncSession, ms: Message, user_id: int):
-    return await session.scalar(
-        select(Group).join(User, User.group_id == Group.id)
-        .where(User.telegram_id == account_id(ms, user_id))
+def subject_block(subject: SessionSubject) -> InputRichBlockDetails:
+    paragraphs = [InputRichBlockParagraph(text=subject.text)]
+    dates = [
+        f"№{index} - {task.due_date:%d.%m.%Y}"
+        for index, task in enumerate(subject.tasks, 1)
+        if task.due_date is not None
+    ]
+    if dates:
+        paragraphs.append(InputRichBlockParagraph(text="Сроки: " + ", ".join(dates)))
+    return InputRichBlockDetails(
+        summary=f"{subject.subject} · заданий: {len(subject.tasks)}",
+        blocks=paragraphs,
+        is_open=True,
     )
 
 
-def render_session(group: str, key: str, tasks: list[SessionTask], owner: int, deletion: bool = False) -> InputRichMessage:
+def render_session(
+    group: str, semester: str, subjects: list[SessionSubject]
+) -> InputRichMessage:
+    year, half = semester.split("-")
+    term = f"Весна {year}" if half == "1" else f"Осень {year} / зима {int(year) + 1}"
     blocks = [
         InputRichBlockSectionHeading(text="📚 Подготовка к сессии", size=1),
-        InputRichBlockParagraph(text=f"{semester_title(key)} · Группа {group}"),
-        InputRichBlockParagraph(text="Задания до сессии для всей группы. Добавить: /session_add. Удалить: /session_delete"),
+        InputRichBlockParagraph(text=f"{term} · Группа {group}"),
     ]
-    subjects = {}
-    for task in tasks:
-        subjects.setdefault(task.subject, []).append(task)
-    for subject, items in subjects.items():
-        contents = []
-        for index, task in enumerate(items):
-            if index:
-                contents.append(InputRichBlockDivider())
-            contents.append(InputRichBlockParagraph(text=RichTextBold(text=task.text)))
-            contents.append(InputRichBlockParagraph(text=f"Срок: {task.due_date:%d.%m.%Y}" if task.due_date else "Без срока"))
-            if deletion:
-                contents.append(InputRichBlockButtons(buttons=[RichMessageButton(
-                    text="Удалить", style="danger",
-                    callback_data=f"session_delete:ask:{owner}:{key}:{task.id}",
-                )]))
-        blocks.append(InputRichBlockDetails(summary=f"{subject} · заданий: {len(items)}", blocks=contents, is_open=True))
-    if not tasks:
-        blocks.append(InputRichBlockParagraph(text="Требований пока нет. Добавь первое через /session_add."))
+    blocks.extend(subject_block(subject) for subject in subjects)
+    if not subjects:
+        blocks.append(
+            InputRichBlockParagraph(
+                text="Заданий пока нет. Добавь первое через /session_add."
+            )
+        )
     return InputRichMessage(blocks=blocks)
 
 
-async def session_view(session: AsyncSession, group: Group, key: str, owner: int, deletion: bool = False):
-    tasks = list(await session.scalars(
-        select(SessionTask).where(SessionTask.group_id == group.id, SessionTask.semester == key)
-        .order_by(SessionTask.subject, SessionTask.due_date.asc().nulls_last(), SessionTask.id)
-    ))
-    return render_session(group.name, key, tasks, owner, deletion)
-
-
-@router.message(Command("session"), StateFilter(None))
-async def command_session(ms: Message, command: CommandObject, session: AsyncSession, deletion: bool = False):
+@router.message(Command("sessia", "session"), StateFilter(None))
+async def command_session(ms: Message, command: CommandObject, api: PolytechApi):
     if ms.from_user is None:
         return
-    key = (command.args or current_semester()).strip()
-    if re.fullmatch(r"[0-9]{4}-[12]", key) is None:
-        name = "session_delete" if deletion else "session"
-        await ms.answer(f"Используй /{name} или /{name} 2026-2. 1 - весна, 2 - осень и следующая зима.")
+    semester = (command.args or "").strip() or current_semester()
+    if re.fullmatch(r"[0-9]{4}-[12]", semester) is None:
+        await ms.answer(
+            "Используй /sessia или /sessia 2026-2. 1 - весна, 2 - осень и следующая зима."
+        )
         return
-    group = await user_group(session, ms, ms.from_user.id)
+    group = await group_for_account(account_id(ms, ms.from_user.id))
     if group is None:
-        await ms.answer("Сначала укажи свою учебную группу.")
+        await ms.answer("Сначала укажи свою учебную группу через /start.")
         return
-    await ms.answer_rich(await session_view(session, group, key, ms.from_user.id, deletion))
+    try:
+        subjects = await api.session_tasks(group, semester)
+    except ApiError:
+        logger.exception("Failed to load session tasks")
+        await ms.answer("Не удалось загрузить задания к сессии. Попробуй позже.")
+        return
+    await ms.answer_rich(render_session(group, semester, subjects))
 
 
-@router.message(Command("session_delete"), StateFilter(None))
-async def command_session_delete(ms: Message, command: CommandObject, session: AsyncSession):
-    await command_session(ms, command, session, deletion=True)
-
-
-@router.message(Command("session_add"), StateFilter(None))
-async def command_session_add(ms: Message, state: FSMContext, session: AsyncSession):
+@router.message(Command("session_add"), StateFilter(None, AddSessionTask))
+async def command_session_add(ms: Message, state: FSMContext, command: CommandObject):
     if ms.from_user is None:
         return
-    group = await user_group(session, ms, ms.from_user.id)
+    group = await group_for_account(account_id(ms, ms.from_user.id))
     if group is None:
-        await ms.answer("Сначала укажи свою учебную группу.")
+        await ms.answer("Сначала укажи свою учебную группу через /start.")
+        return
+    mode = (command.args or "").strip()
+    if mode not in {"", "manual"}:
+        await ms.answer(
+            "Используй /session_add или /session_add manual для ручного ввода."
+        )
         return
     await state.clear()
-    await state.update_data(group_id=group.id, semester=current_semester())
-    await state.set_state(AddSessionTask.text)
-    await ms.answer("Отправь предмет и всё, что нужно сделать до сессии, одним сообщением. Например: по тимп сдать лабораторные 1-4 и защитить курсовую до 20 декабря. ИИ разделит задачи. Отмена: /cancel")
+    await state.set_data(
+        {"group": group, "semester": current_semester(), "manual": mode == "manual"}
+    )
+    await state.set_state(AddSessionTask.waiting_for_text)
+    if not mode:
+        await ms.answer(
+            "Опиши задания к сессии одним сообщением. Например: по физике сдать "
+            "лабораторные 1-4 и защитить курсовую до 20 декабря.\n\n"
+            "Для ручного ввода используй /session_add manual. Для отмены используй /cancel."
+        )
+        return
+    await ms.answer(
+        "Отправь предмет и задание с новой строки. Срок можно указать в первой строке после предмета через |.\n\n"
+        "Физика | 20.12.2026\n"
+        "Сдать отчёты по лабораторным работам\n\n"
+        "Для отмены используй /cancel."
+    )
 
 
-@router.message(StateFilter(AddSessionTask), Command("cancel"))
+@router.message(Command("cancel"), StateFilter(AddSessionTask))
 async def cancel_session_add(ms: Message, state: FSMContext):
     await state.clear()
-    await ms.answer("Добавление требований к сессии отменено.")
+    await ms.answer("Добавление задания к сессии отменено.")
 
 
-async def prepare_session_tasks(ms: Message, state: FSMContext, session: AsyncSession, text: str):
-    if ms.from_user is None:
+@router.message(AddSessionTask.waiting_for_text, F.text, ~F.text.startswith("/"))
+async def receive_session_task(ms: Message, state: FSMContext):
+    text = ms.text.strip()
+    if not text:
+        await ms.answer("Отправь текст задания.")
         return
     data = await state.get_data()
-    group = await user_group(session, ms, ms.from_user.id)
-    if group is None or group.id != data.get("group_id"):
-        await state.clear()
-        await ms.answer("Группа изменилась. Начни заново: /session_add.")
-        return
-    await state.update_data(raw_text=text)
-    try:
-        schedule = await asyncio.to_thread(get_semester_schedule, group.name)
-        existing = list(await session.scalars(select(SessionTask.subject).where(
-            SessionTask.group_id == group.id, SessionTask.semester == data["semester"],
-        ).distinct()))
-        names = {}
-        for name in existing + [lesson["subject"] for lesson in schedule["lessons"]]:
-            names.setdefault(subject_key(name), name)
-        parsed = await asyncio.to_thread(parse_session_tasks, text, list(names.values()), datetime.now(ZoneInfo("Europe/Moscow")).date())
-    except SubjectClarificationRequired:
-        await state.set_state(AddSessionTask.subject)
-        await ms.answer("Уточни один предмет полным названием. Если предметов несколько, добавь их отдельно.")
-        return
-    except Exception:
-        logger.exception("Failed to parse session tasks")
-        await ms.answer("Не удалось обработать задания через ИИ. Ничего не добавлено. Повтори сообщение или используй /cancel.")
+    if data.get("manual"):
+        task = await manual_task(ms, data, text)
+        if task is None:
+            return
+        preview = f"Добавить задание для группы {task.group}?\n\n{task.subject}\n{task_details(task)}"
+    else:
+        task = SessionTaskText(
+            group=data["group"], semester=data["semester"], text=text
+        )
+        preview = (
+            f"Разобрать текст и сохранить задания для группы {task.group}?\n\n{text}"
+        )
+    if len(preview.encode("utf-16-le")) // 2 > 4096:
+        await ms.answer(
+            "Сократи текст задания, чтобы он поместился в сообщении подтверждения."
+        )
         return
     token = uuid4().hex
-    await state.update_data(parsed=parsed.model_dump(), token=token)
-    await state.set_state(AddSessionTask.confirmation)
-    lines = [f"<b>{escape(parsed.subject)}</b>"]
-    for index, task in enumerate(parsed.tasks, 1):
-        due = date.fromisoformat(task.due_date).strftime("%d.%m.%Y") if task.due_date else "без срока"
-        lines.append(f"{index}. {escape(task.text)} ({due})")
-    lines.append("Дополнить список этого предмета для всей группы?")
-    preview = "\n\n".join(lines)
-    if len(preview) > 3800:
-        await state.set_state(AddSessionTask.text)
-        await ms.answer("Список слишком большой для подтверждения. Отправь его несколькими сообщениями через /session_add.")
+    await ms.answer(
+        preview,
+        parse_mode=None,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Добавить", callback_data=f"session_save:{token}"
+                    ),
+                    InlineKeyboardButton(
+                        text="Отмена", callback_data=f"session_cancel:{token}"
+                    ),
+                ]
+            ]
+        ),
+    )
+    await state.update_data(task=task.model_dump(mode="json"), token=token)
+    await state.set_state(AddSessionTask.waiting_for_confirmation)
+
+
+async def manual_task(ms: Message, data: dict, text: str) -> SessionTaskDraft | None:
+    header, _, text = text.partition("\n")
+    subject, separator, due_text = header.partition("|")
+    subject, text = subject.strip(), text.strip()
+    if not subject or len(subject) > 200 or not text:
+        await ms.answer(
+            "На первой строке укажи предмет (до 200 символов), на следующих строках напиши задание."
+        )
         return
-    await ms.answer(preview, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Добавить", callback_data=f"session_save:{token}"),
-        InlineKeyboardButton(text="Отмена", callback_data=f"session_cancel:{token}"),
-    ]]))
+    due = None
+    if separator:
+        try:
+            due = datetime.strptime(due_text.strip(), "%d.%m.%Y").date()
+        except ValueError:
+            await ms.answer("Укажи срок в формате ДД.ММ.ГГГГ или убери | и дату.")
+            return
+    return SessionTaskDraft(
+        group=data["group"],
+        semester=data["semester"],
+        subject=subject,
+        text=text,
+        due_date=due,
+    )
 
 
-@router.message(AddSessionTask.text, F.text, ~F.text.startswith("/"))
-async def receive_session_text(ms: Message, state: FSMContext, session: AsyncSession):
-    text = ms.text.strip()
-    if not 1 <= len(text) <= 4000:
-        await ms.answer("Отправь от 1 до 4000 символов с предметом и заданиями.")
-        return
-    await prepare_session_tasks(ms, state, session, text)
-
-
-@router.message(AddSessionTask.subject, F.text, ~F.text.startswith("/"))
-async def receive_session_subject(ms: Message, state: FSMContext, session: AsyncSession):
+@router.callback_query(
+    F.data.startswith("session_save:") | F.data.startswith("session_cancel:")
+)
+async def confirm_session_task(
+    callback: CallbackQuery, state: FSMContext, api: PolytechApi
+):
+    ms = callback.message
     data = await state.get_data()
-    await prepare_session_tasks(ms, state, session, f"{data['raw_text']}\nУточнение предмета: {ms.text}")
-
-
-async def append_session_tasks(session: AsyncSession, group_id: int, key: str, parsed: ParsedSessionTasks) -> tuple[int, int]:
-    try:
-        group = await session.scalar(select(Group).where(Group.id == group_id).with_for_update())
-        if group is None:
-            raise ValueError("Group no longer exists")
-        rows = list(await session.scalars(select(SessionTask).where(
-            SessionTask.group_id == group_id, SessionTask.semester == key,
-        ).order_by(SessionTask.id)))
-        candidates = [task for task in rows if subject_key(task.subject) == subject_key(parsed.subject)]
-        canonical = candidates[0].subject if candidates else parsed.subject
-        for task in candidates:
-            task.subject = canonical
-        created = updated = 0
-        for incoming in parsed.tasks:
-            matched = next((task for task in candidates if normalize_deadline_text(task.text) == normalize_deadline_text(incoming.text)), None)
-            merged = incoming.text
-            if matched is None and candidates:
-                comparison = await asyncio.to_thread(reconcile_homework, incoming.text, [task.text for task in candidates])
-                if comparison.match_index is not None:
-                    matched = candidates[comparison.match_index]
-                    merged = comparison.merged_homework
-            due = date.fromisoformat(incoming.due_date) if incoming.due_date else None
-            if matched is not None:
-                changed = False
-                if normalize_deadline_text(matched.text) != normalize_deadline_text(merged):
-                    matched.text = merged
-                    changed = True
-                if due is not None and matched.due_date != due:
-                    matched.due_date = due
-                    changed = True
-                updated += int(changed)
-            else:
-                task = SessionTask(group_id=group_id, semester=key, subject=canonical, text=incoming.text, due_date=due)
-                session.add(task)
-                candidates.append(task)
-                created += 1
-        await session.commit()
-        return created, updated
-    except Exception:
-        await session.rollback()
-        raise
-
-
-@router.callback_query(F.data.startswith("session_save:") | F.data.startswith("session_cancel:"))
-async def confirm_session_tasks(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    data = await state.get_data()
-    if await state.get_state() != AddSessionTask.confirmation.state or (callback.data or "").split(":", 1)[1] != data.get("token"):
+    if (
+        not isinstance(ms, Message)
+        or await state.get_state() != AddSessionTask.waiting_for_confirmation.state
+        or callback.data.split(":", 1)[1] != data.get("token")
+    ):
         await callback.answer("Это подтверждение уже неактуально.")
-        return
-    if not isinstance(callback.message, Message):
-        await callback.answer()
         return
     await callback.answer()
     if callback.data.startswith("session_cancel:"):
         await state.clear()
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer("Добавление отменено.")
+        await ms.edit_reply_markup(reply_markup=None)
+        await ms.answer("Добавление задания к сессии отменено.")
         return
-    group = await user_group(session, callback.message, callback.from_user.id)
-    if group is None or group.id != data.get("group_id"):
+    payload = data["task"]
+    if payload["group"] != await group_for_account(
+        account_id(ms, callback.from_user.id)
+    ):
         await state.clear()
-        await callback.message.answer("Группа изменилась. Начни заново: /session_add.")
+        await ms.edit_reply_markup(reply_markup=None)
+        await ms.answer("Группа изменилась. Начни заново через /session_add.")
         return
+    reply = "Задание добавлено. Список заданий группы доступен через /sessia."
+    subject = None
     try:
-        created, updated = await append_session_tasks(session, group.id, data["semester"], ParsedSessionTasks.model_validate(data["parsed"]))
-    except Exception:
-        logger.exception("Failed to append session tasks")
-        await callback.message.answer("Не удалось дополнить список. Ничего не сохранено. Повтори подтверждение или используй /cancel.")
-        return
+        if "subject" in payload:
+            await api.add_session_task(SessionTaskDraft.model_validate(payload))
+        else:
+            subject = await api.add_session_tasks_from_text(
+                SessionTaskText.model_validate(payload)
+            )
+    except ApiError as exc:
+        if exc.status == 422:
+            await state.set_state(AddSessionTask.waiting_for_text)
+            await ms.edit_reply_markup(reply_markup=None)
+            detail = exc.detail or "Уточни предмет, задания или сроки."
+            await ms.answer(
+                f"{detail}\nОтправь полный текст с уточнением или используй /cancel.",
+                parse_mode=None,
+            )
+            return
+        if exc.status != 409:
+            logger.warning("Failed to save session task, API status %s", exc.status)
+            await ms.answer(
+                "Не удалось сохранить задание. Повтори подтверждение или используй /cancel."
+            )
+            return
+        reply = (
+            "Такое задание уже есть у группы. Список заданий доступен через /sessia."
+        )
     await state.clear()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(f"Добавлено задач: {created}. Дополнено: {updated}. Список по предметам: /session")
+    await ms.edit_reply_markup(reply_markup=None)
+    if subject is None:
+        await ms.answer(reply)
+    else:
+        await ms.answer_rich(
+            InputRichMessage(
+                blocks=[
+                    InputRichBlockParagraph(
+                        text="Актуальный список заданий по предмету"
+                    ),
+                    subject_block(subject),
+                ]
+            )
+        )
 
 
 @router.message(StateFilter(AddSessionTask))
-async def session_text_required(ms: Message):
-    await ms.answer("Отправь текст или подтверди добавление кнопкой. Отмена: /cancel.")
-
-
-@router.callback_query(F.data.startswith("session_set:"))
-async def obsolete_session_completion(callback: CallbackQuery):
-    await callback.answer("Отметки выполнения убраны. Открой список заново: /session.", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("session_delete:"))
-async def delete_session_task(callback: CallbackQuery, session: AsyncSession):
-    ms = callback.message
-    if not isinstance(ms, Message):
-        await callback.answer()
-        return
-    try:
-        _, action, owner, key, task_id = (callback.data or "").split(":")
-        owner, task_id = int(owner), int(task_id)
-        if action not in {"ask", "yes", "no"} or re.fullmatch(r"[0-9]{4}-[12]", key) is None:
-            raise ValueError("Invalid callback")
-    except ValueError:
-        await callback.answer("Некорректная кнопка.")
-        return
-    if owner != callback.from_user.id:
-        await callback.answer("Открой свой список через /session_delete.", show_alert=True)
-        return
-    if action == "no":
-        await callback.answer("Удаление отменено.")
-        await ms.edit_text("Удаление отменено. Список заданий: /session")
-        return
-    group = await user_group(session, ms, owner)
-    if group is None:
-        await callback.answer("Сначала укажи свою учебную группу.", show_alert=True)
-        return
-    condition = (SessionTask.id == task_id, SessionTask.group_id == group.id, SessionTask.semester == key)
-    try:
-        if action == "ask":
-            task = await session.scalar(select(SessionTask).where(*condition))
-            if task is None:
-                await callback.answer("Задание уже удалено или недоступно.")
-                return
-            await callback.answer()
-            prefix = f"session_delete:{{}}:{owner}:{key}:{task_id}"
-            await ms.answer(
-                f"Удалить задание к сессии для всей группы?\n\n"
-                f"<b>{escape(task.subject)}</b>\n{escape(task.text)}",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="Да, удалить", callback_data=prefix.format("yes")),
-                    InlineKeyboardButton(text="Отмена", callback_data=prefix.format("no")),
-                ]]),
-            )
-            return
-        result = await session.execute(delete(SessionTask).where(*condition).returning(SessionTask.id))
-        deleted = result.scalar_one_or_none()
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        logger.exception("Failed to delete session task")
-        await callback.answer("Не удалось удалить задание. Попробуй позже.", show_alert=True)
-        return
-    text = "Задание удалено для всей группы." if deleted is not None else "Задание уже удалено или недоступно."
-    await callback.answer(text)
-    await ms.edit_text(text)
-    await ms.answer_rich(await session_view(session, group, key, owner))
+async def session_task_input_required(ms: Message):
+    await ms.answer(
+        "Отправь предмет и задание, нажми кнопку подтверждения или используй /cancel."
+    )

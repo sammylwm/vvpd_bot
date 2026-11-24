@@ -3,24 +3,34 @@ services:
     build:
       dockerfile: ./Dockerfile
     restart: unless-stopped
+    env_file:
+      - src/settings/.env
     environment:
-      APP_ENV: prod
-    depends_on:
-      - db
+      POSTGRES_HOST: db
     networks:
       - default
       - shared
-    command: ["uv", "run", "src/main.py"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
     image: docker.io/library/postgres:17
+    restart: unless-stopped
     env_file:
       - src/settings/.env
     volumes:
-      - teha_bot:/var/lib/postgresql/data
+      - polytech_plan:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 volumes:
-  teha_bot:
+  polytech_plan:
 
 
 networks:
