@@ -1,14 +1,18 @@
 import asyncio
+import logging
 from html import escape
 from urllib.parse import urlsplit
 
+from aiohttp import ClientError
 from aiogram import BaseMiddleware
-from aiogram.types import LinkPreviewOptions, Message, Update
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import LinkPreviewOptions, Message, URLInputFile, Update
 
 from core.api import Deadline
 
 MAX_FILES = 5
 MAX_FILE_SIZE = 20 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class AlbumMiddleware(BaseMiddleware):
@@ -68,16 +72,24 @@ def attachment_from_message(message: Message) -> dict | None:
 
 async def send_attachment_links(message: Message, deadlines: list[Deadline]) -> None:
     for deadline in deadlines:
-        links = []
         for attachment in deadline.attachments:
             url = urlsplit(attachment.url)
-            if url.scheme in {"http", "https"} and url.netloc:
-                links.append(
-                    f'<a href="{escape(attachment.url)}">{escape(attachment.name)}</a>'
+            if url.scheme not in {"http", "https"} or not url.netloc:
+                continue
+            try:
+                await message.answer_document(
+                    URLInputFile(attachment.url, filename=attachment.name),
+                    caption=(
+                        f"📎 {escape(deadline.subject)} · "
+                        f"{deadline.date:%d.%m.%Y} · {escape(attachment.name)}"
+                    ),
                 )
-        if links:
-            await message.answer(
-                f"📎 {escape(deadline.subject)} · {deadline.date:%d.%m.%Y}\n"
-                + "\n".join(links),
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
+            except (ClientError, TelegramAPIError, OSError, ValueError):
+                logger.exception(
+                    "Failed to send deadline attachment %s", attachment.name
+                )
+                await message.answer(
+                    f'Не удалось прикрепить файл: '
+                    f'<a href="{escape(attachment.url)}">{escape(attachment.name)}</a>',
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
