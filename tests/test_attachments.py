@@ -102,7 +102,15 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 {"name": "a&b.pdf", "size": 3, "url": "https://example.com/attachment/"}
             ],
         )
-        with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
+        with (
+            patch.object(Message, "answer", new_callable=AsyncMock) as answer,
+            patch.object(
+                Message,
+                "answer_document",
+                new_callable=AsyncMock,
+                side_effect=ValueError("invalid document"),
+            ),
+        ):
             await send_attachment_links(message(1), [task])
         self.assertIn(
             '<a href="https://example.com/attachment/">a&amp;b.pdf</a>',
