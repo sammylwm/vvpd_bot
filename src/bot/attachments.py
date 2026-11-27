@@ -73,12 +73,15 @@ def attachment_from_message(message: Message) -> dict | None:
 async def send_attachment_links(message: Message, deadlines: list[Deadline]) -> None:
     for deadline in deadlines:
         for attachment in deadline.attachments:
-            url = urlsplit(attachment.url)
+            attachment_url = attachment.url
+            if not urlsplit(attachment_url).scheme:
+                attachment_url = f"http://{attachment_url.lstrip('/')}"
+            url = urlsplit(attachment_url)
             if url.scheme not in {"http", "https"} or not url.netloc:
                 continue
             try:
                 await message.answer_document(
-                    URLInputFile(attachment.url, filename=attachment.name),
+                    URLInputFile(attachment_url, filename=attachment.name),
                     caption=(
                         f"📎 {escape(deadline.subject)} · "
                         f"{deadline.date:%d.%m.%Y} · {escape(attachment.name)}"
@@ -90,6 +93,6 @@ async def send_attachment_links(message: Message, deadlines: list[Deadline]) -> 
                 )
                 await message.answer(
                     f'Не удалось прикрепить файл: '
-                    f'<a href="{escape(attachment.url)}">{escape(attachment.name)}</a>',
+                    f'<a href="{escape(attachment_url)}">{escape(attachment.name)}</a>',
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
